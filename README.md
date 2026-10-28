@@ -109,6 +109,8 @@ El ícono se atenúa sin sesiones y se pone rojo mientras haya una alerta activa
 
 ## Instalación con Homebrew
 
+Requisitos: macOS 13 o superior, [Homebrew](https://brew.sh) y las Command Line Tools (`xcode-select --install`; se compila desde el código fuente, no hace falta Xcode completo).
+
 1. Confía en el tap (desde Homebrew 7 los taps de terceros lo requieren antes de instalar):
 
    ```sh
@@ -127,6 +129,8 @@ El ícono se atenúa sin sesiones y se pone rojo mientras haya una alerta activa
    brew services start guachiman
    ```
 
+   La primera vez macOS pide permiso para mostrar notificaciones: acéptalo (si lo rechazaste, usa "Activar notificaciones…" en el engranaje del panel). Con `brew services` no actives también "Iniciar al encender".
+
 4. Solo si vas a usar el botón IA: necesitas Claude Code instalado e iniciado sesión, y el directorio del relay debe confiarse una vez:
 
    ```sh
@@ -137,8 +141,6 @@ El ícono se atenúa sin sesiones y se pone rojo mientras haya una alerta activa
    Acepta el aviso de confianza, sal con `/exit` y luego enciende IA en el panel. Detalles en [relay/README.md](relay/README.md).
 
 Para detenerlo usa `brew services stop guachiman`; para desinstalarlo, `brew uninstall guachiman`.
-
-Se compila desde el código fuente, así que necesitas las Command Line Tools (`xcode-select --install`). No hace falta Xcode completo.
 
 Desde la terminal puedes ejecutar `guachiman --once` para ver un diagnóstico.
 
