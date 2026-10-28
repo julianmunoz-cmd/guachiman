@@ -68,7 +68,16 @@ El ícono se atenúa sin sesiones y se pone rojo mientras haya una alerta activa
 
 ## Instalación con Homebrew
 
-Próximamente.
+```sh
+brew install xklbr/tap/guachiman
+brew services start guachiman
+```
+
+`brew services start` lo inicia ahora y cada vez que inicies sesión. Para detenerlo, usa `brew services stop guachiman`.
+
+Se compila desde el código fuente, así que necesitas las Command Line Tools (`xcode-select --install`). No hace falta Xcode completo.
+
+Desde la terminal también puedes ejecutar `guachiman --once` para ver un diagnóstico.
 
 ## Licencia
 
