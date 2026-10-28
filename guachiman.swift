@@ -1363,8 +1363,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             track.addSubview(bar)
             root.addSubview(track)
         }
-        meter(pad + 8, "Memoria libre", "\(snap.freePercent)%", Double(snap.freePercent) / 100,
-              nsColor(freeMemoryColor(freePercent: snap.freePercent)), "Memoria libre \(snap.freePercent) %")
+        meter(pad + 8, "RAM libre", "\(snap.freePercent)%", Double(snap.freePercent) / 100,
+              nsColor(freeMemoryColor(freePercent: snap.freePercent)), "RAM libre \(snap.freePercent) %")
         meter(pad + 8 + meterW + 12, "CPU", cpuTotal.map { "\(Int($0.rounded()))%" } ?? "—", (cpuTotal ?? 0) / 100,
               Pal.primary, cpuTotal.map { "CPU \(Int($0.rounded())) %" } ?? "CPU no disponible")
 
