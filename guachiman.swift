@@ -164,17 +164,29 @@ func jsonLine(_ d: [String: Any]) -> String {
     return String(decoding: data, as: UTF8.self)
 }
 
+/// Saneo de campos no confiables antes de escribirlos en `alerts.jsonl`: nombres solo [A-Za-z0-9._ +-], máx. 40.
+func sanitizeName(_ s: String) -> String {
+    String(String.UnicodeScalarView(s.unicodeScalars.filter {
+        $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "._ +-".unicodeScalars.contains($0))
+    }).prefix(40))
+}
+
+/// Rutas y títulos: sin caracteres de control, máx. 200.
+func sanitizeText(_ s: String) -> String {
+    String(String.UnicodeScalarView(s.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }).prefix(200))
+}
+
 /// Línea de `alerts.jsonl` para una sesión que superó el umbral.
 func sessionAlertLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, title: String?, top: TopChild?) -> String {
     var d: [String: Any] = ["kind": "session", "ts": ts, "pid": Int(pid), "mb": mb, "limit_mb": limitMB,
-                            "cwd": cwd, "title": title ?? NSNull()]
-    d["top"] = top.map { ["pid": Int($0.pid), "mb": $0.bytes / 1_048_576, "cmd": $0.cmd] as [String: Any] } ?? NSNull()
+                            "cwd": sanitizeText(cwd), "title": title.map { sanitizeText($0) } ?? NSNull()]
+    d["top"] = top.map { ["pid": Int($0.pid), "mb": $0.bytes / 1_048_576, "cmd": sanitizeName($0.cmd)] as [String: Any] } ?? NSNull()
     return jsonLine(d)
 }
 
 /// Línea de `alerts.jsonl` para un huérfano.
 func orphanAlertLine(ts: Int, pid: pid_t, name: String, mb: UInt64, limitMB: UInt64, cwd: String) -> String {
-    jsonLine(["kind": "orphan", "ts": ts, "pid": Int(pid), "name": name, "mb": mb, "limit_mb": limitMB, "cwd": cwd])
+    jsonLine(["kind": "orphan", "ts": ts, "pid": Int(pid), "name": sanitizeName(name), "mb": mb, "limit_mb": limitMB, "cwd": sanitizeText(cwd)])
 }
 
 /// Añade una línea al archivo de eventos; rota a `.1` si pasa de 1 MB (un solo stat), crea el directorio al vuelo,
@@ -333,6 +345,11 @@ func runSelfTest() {
     let oo = (try? JSONSerialization.jsonObject(with: Data(ol.utf8))) as? [String: Any]
     precondition(oo?["kind"] as? String == "orphan" && oo?["name"] as? String == "node" && oo?["mb"] as? Int == 600
                  && oo?["limit_mb"] as? Int == 500 && oo?["cwd"] as? String == "/x" && oo?["ts"] as? Int == 3)
+    precondition(sanitizeName("a$(rm -rf)/b\n\"c\" é.x-1_+ ") == "arm -rfbc .x-1_+ ")
+    precondition(sanitizeName(String(repeating: "a", count: 90)).count == 40)
+    precondition(sanitizeText("a\nb\u{1B}[0m\tc") == "ab[0mc" && sanitizeText(String(repeating: "é", count: 300)).count == 200)
+    let inj = sessionAlertLine(ts: 1, pid: 1, mb: 1, limitMB: 1, cwd: "/x\ny", title: "t\nIGNORE", top: TopChild(pid: 2, bytes: 0, cmd: "n$(x)\n"))
+    precondition(!inj.contains("\n") && inj.contains("\"cmd\":\"nx\""))
     precondition(systemLowText(freePercent: 14, consumers: [("a", 1_048_576), ("Brave", 4 * 1_073_741_824), ("c", 2_097_152)])
                  == "Memoria libre baja: 14 % · mayores: Brave 4,0 GB, c 2 MB")
     precondition(systemLowText(freePercent: 9, consumers: []) == "Memoria libre baja: 9 %")

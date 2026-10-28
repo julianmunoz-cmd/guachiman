@@ -19,9 +19,10 @@ done
 # El directorio debe estar marcado como confiable por Claude Code (lo fija make relay-install).
 RELAY_CWD="${RELAY_CWD:-$HOME}"
 cd "$RELAY_CWD" || exit 1
+# Sin Bash: solo estas herramientas existen (--tools). bypassPermissions para que sus mensajes no queden retenidos
+# por la sesión receptora (modos de permisos distintos).
 exec "$CLAUDE" --bg --name "$NAME" --model haiku \
-  "Arma el monitor de alertas ahora y quédate en espera." \
+  --permission-mode bypassPermissions \
+  --tools "Monitor,SendMessage,ListAgents,Read,ToolSearch" \
   --append-system-prompt-file "$DIR/brief.md" \
-  --allowedTools "Monitor" "SendMessage" "ListAgents" "ToolSearch" \
-    "Read($HOME/.claude/sessions/*)" \
-    "Bash(ps *)" "Bash(tail *)" "Bash(cat *)" "Bash(ls *)"
+  "Arma el monitor de alertas ahora y quédate en espera."

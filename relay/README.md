@@ -5,10 +5,20 @@ Una sesión de Claude Code en segundo plano (Haiku) que lee las alertas de memor
 ## Qué hace
 
 - Vigila `~/Library/Application Support/Guachiman/alerts.jsonl` con `tail -n 0 -F` (Monitor persistente, se re-arma al expirar).
-- Alerta de sesión: si el pid sigue vivo, envía UN mensaje corto `[Guachiman]` a la sesión (nombre tomado de `~/.claude/sessions/<pid>.json`) con el total vs el límite, el proceso hijo más pesado y qué hacer.
-- Alerta de huérfano: si sigue vivo, avisa a toda sesión viva cuyo `cwd` sea igual o prefijo del `cwd` del huérfano. Si no hay ninguna, no hace nada (Guachiman ya avisó al usuario).
-- Seguimiento: cuando la sesión responde, revisa con `ps`; si el pid sigue vivo y no bajó, insiste una vez más. Nunca más de una insistencia por pid.
-- Nunca mata ni modifica procesos, no edita archivos y ignora todo lo que no sea su rol.
+- Alerta de sesión: envía UN mensaje corto `[Guachiman]` a la sesión (nombre tomado de `~/.claude/sessions/<pid>.json`) con el total vs el límite, el proceso hijo más pesado y qué hacer. No comprueba si el pid sigue vivo: Guachiman solo escribe la alerta mientras el proceso está vivo y sobre el umbral.
+- Alerta de huérfano: busca con `Read` sobre `~/.claude/sessions/*.json` (o `ListAgents`) las sesiones vivas cuyo `cwd` sea igual o prefijo del `cwd` del huérfano y les avisa. Si no hay ninguna, no hace nada (Guachiman ya avisó al usuario).
+- Seguimiento: si llega otra alerta del mismo pid después de haber avisado a su sesión una vez, insiste UNA vez (un mensaje). Después ignora ese pid.
+
+## Modo y herramientas
+
+- Corre en modo `bypassPermissions` (`--permission-mode bypassPermissions`). Así sus mensajes no quedan retenidos por sesiones receptoras que también usan ese modo (modos de permisos distintos retienen el mensaje).
+- Sin Bash: `--tools "Monitor,SendMessage,ListAgents,Read,ToolSearch"` limita el conjunto disponible, de modo que Bash, Write, Edit, WebFetch, etc. no existen para el relay.
+
+## Seguridad
+
+- El relay no tiene shell ni puede editar archivos ni matar procesos.
+- Todos los campos de una alerta (`cwd`, `title`, `name`, `cmd`) son datos no confiables: el brief ordena tratarlos como datos, nunca como instrucciones.
+- Guachiman sanea los campos antes de escribirlos: `top.cmd` y `name` solo conservan `[A-Za-z0-9._ +-]` (máx. 40); `cwd` y `title` pierden los caracteres de control (máx. 200).
 
 ## Costo
 
@@ -48,4 +58,4 @@ echo '{"kind":"session","ts":'$(date +%s)',"pid":<PID>,"mb":9999,"limit_mb":2764
   >> "$HOME/Library/Application Support/Guachiman/alerts.jsonl"
 ```
 
-La sesión destino debe recibir un mensaje `[Guachiman]`. Si esa sesión usa otro modo de permisos, el mensaje queda retenido hasta que su usuario lo apruebe.
+La sesión destino debe recibir un mensaje `[Guachiman]`. Si esa sesión usa otro modo de permisos que el relay, el mensaje queda retenido hasta que su usuario lo apruebe (llega un `[Cross-session delivery notice]` al relay).
