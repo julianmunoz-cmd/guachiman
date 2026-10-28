@@ -500,15 +500,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastSnap = snap
         lastAlerting = alerting
         if let button = statusItem.button {
-            let base = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Guachiman")
+            // Ícono propio de 18 pt de alto; si no está en el bundle, usa el SF Symbol.
+            let base: NSImage?
+            if let custom = Bundle.main.image(forResource: "MenuBarIcon") {
+                let ratio = custom.size.height > 0 ? custom.size.width / custom.size.height : 1
+                custom.size = NSSize(width: 18 * ratio, height: 18)
+                base = custom
+            } else {
+                base = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Guachiman")
+            }
+            base?.isTemplate = true
             if alerting {
-                let config = NSImage.SymbolConfiguration(paletteColors: [.systemRed])
-                let image = base?.withSymbolConfiguration(config)
-                image?.isTemplate = false
+                // Un bitmap no acepta paletas de SF Symbols: se pinta una copia roja no plantilla.
+                let image = base.map { src -> NSImage in
+                    let red = NSImage(size: src.size, flipped: false) { rect in
+                        src.draw(in: rect)
+                        NSColor.systemRed.set()
+                        rect.fill(using: .sourceAtop)
+                        return true
+                    }
+                    red.isTemplate = false
+                    return red
+                }
                 button.image = image
                 button.alphaValue = 1
             } else {
-                base?.isTemplate = true
                 button.image = base
                 button.alphaValue = snap.sessions.isEmpty ? 0.4 : 1
             }

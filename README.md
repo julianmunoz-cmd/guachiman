@@ -39,6 +39,7 @@ make run      # compila y abre la app
 make check    # ejecuta --once
 make test     # ejecuta --selftest
 make notify-test  # compila, abre la app y envía una notificación de prueba
+make icon     # regenera icon/AppIcon.icns y los PNG de la barra desde icon/*.svg
 make clean
 ```
 
