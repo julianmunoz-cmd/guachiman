@@ -148,6 +148,112 @@ func appendPending(rootPid: pid_t, line: String) {
 
 func removePending(rootPid: pid_t) { unlink("\(Config.pendingDir)/\(rootPid).jsonl") }
 
+// MARK: - Título de sesión de Claude Code
+
+/// Directorio codificado de proyectos de Claude: cada carácter no alfanumérico del cwd pasa a "-".
+func encodedProjectDir(_ cwd: String) -> String {
+    String(cwd.unicodeScalars.map { s -> Character in
+        (s.isASCII && (CharacterSet.alphanumerics.contains(s))) ? Character(s) : "-"
+    })
+}
+
+/// Últimos `customTitle` y `aiTitle` de un trozo de JSONL.
+func lastTitles(in text: String) -> (custom: String?, ai: String?) {
+    var custom: String?, ai: String?
+    for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
+        let isC = custom == nil && line.contains("\"custom-title\"")
+        let isA = ai == nil && line.contains("\"ai-title\"")
+        guard isC || isA,
+              let o = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { continue }
+        if isC, o["type"] as? String == "custom-title", let t = o["customTitle"] as? String, !t.isEmpty { custom = t }
+        if isA, o["type"] as? String == "ai-title", let t = o["aiTitle"] as? String, !t.isEmpty { ai = t }
+        if custom != nil { break }   // el renombrado manual manda; no hace falta seguir
+    }
+    return (custom, ai)
+}
+
+/// Título de una sesión desde un trozo de JSONL: el último `custom-title` gana sobre el último `ai-title`.
+func extractSessionTitle(_ text: String) -> String? {
+    let t = lastTitles(in: text)
+    return t.custom ?? t.ai
+}
+
+func truncatedTitle(_ s: String) -> String { s.count > 50 ? String(s.prefix(49)) + "…" : s }
+
+private struct TitleEntry { var title: String?; var mtime: Date; var checkedAt: Date }
+private var titleCache: [pid_t: TitleEntry] = [:]
+private var transcriptPathCache: [String: String?] = [:]
+private let claudeDir = NSHomeDirectory() + "/.claude"
+
+private func transcriptPath(sessionId: String, cwd: String) -> String? {
+    let direct = "\(claudeDir)/projects/\(encodedProjectDir(cwd))/\(sessionId).jsonl"
+    if FileManager.default.fileExists(atPath: direct) { return direct }
+    if let c = transcriptPathCache[sessionId] { return c }
+    let base = "\(claudeDir)/projects"
+    var found: String?
+    for d in (try? FileManager.default.contentsOfDirectory(atPath: base)) ?? [] {
+        let p = "\(base)/\(d)/\(sessionId).jsonl"
+        if FileManager.default.fileExists(atPath: p) { found = p; break }
+    }
+    transcriptPathCache[sessionId] = found
+    return found
+}
+
+/// Lee todo el archivo en trozos de 1 MB (sin cargarlo entero), conservando el último título de cada tipo.
+private func scanWholeFile(_ fh: FileHandle) -> String? {
+    var custom: String?, ai: String?
+    var carry = Data()
+    try? fh.seek(toOffset: 0)
+    while true {
+        let chunk = (try? fh.read(upToCount: 1 << 20)) ?? Data()
+        let eof = chunk.isEmpty
+        var buf = carry + chunk
+        carry = Data()
+        if !eof, let nl = buf.lastIndex(of: 0x0A) {
+            carry = buf.suffix(from: nl + 1)
+            buf = buf.prefix(through: nl)
+        } else if !eof { carry = buf; continue }
+        let t = lastTitles(in: String(decoding: buf, as: UTF8.self))
+        if let c = t.custom { custom = c }
+        if let a = t.ai { ai = a }
+        if eof { break }
+    }
+    return custom ?? ai
+}
+
+/// Título de la sesión (lo que muestra la pestaña de la terminal), con caché en memoria. Solo se llama
+/// cuando hace falta una etiqueta; refresca a lo sumo cada 5 min y solo si cambió el mtime de la transcripción.
+func sessionTitle(pid: pid_t) -> String? {
+    let now = Date()
+    let old = titleCache[pid]
+    if let old, now.timeIntervalSince(old.checkedAt) < 300 { return old.title }
+    var entry = TitleEntry(title: nil, mtime: .distantPast, checkedAt: now)
+    defer { titleCache[pid] = entry }
+    guard let data = FileManager.default.contents(atPath: "\(claudeDir)/sessions/\(pid).json"),
+          let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let sid = o["sessionId"] as? String, let cwd = o["cwd"] as? String,
+          let path = transcriptPath(sessionId: sid, cwd: cwd),
+          let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    else { return nil }
+    entry.mtime = mtime
+    if let old, old.mtime == mtime { entry.title = old.title; return old.title }
+    guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? fh.close() }
+    let size = (try? fh.seekToEnd()) ?? 0
+    let tail: UInt64 = 256 * 1024
+    try? fh.seek(toOffset: size > tail ? size - tail : 0)
+    let text = String(decoding: (try? fh.readToEnd()) ?? Data(), as: UTF8.self)
+    var title = extractSessionTitle(text)
+    if title == nil { title = old != nil ? old?.title : (size > tail ? scanWholeFile(fh) : nil) }
+    entry.title = title
+    return title
+}
+
+func pruneTitleCache(live: Set<pid_t>) { titleCache = titleCache.filter { live.contains($0.key) } }
+
+/// Etiqueta visible: título de Claude Code (máx. 50) o, sin él, la carpeta.
+func sessionLabel(_ s: Session) -> String { sessionTitle(pid: s.pid).map(truncatedTitle) ?? s.label }
+
 func runSelfTest() {
     var top: TopChild?
     top = largerChild(top, pid: 10, bytes: 999, root: 10)            // la raíz no cuenta
@@ -229,6 +335,13 @@ func runSelfTest() {
     precondition((d["KeepAlive"] as? [String: Bool])?["SuccessfulExit"] == false)
     precondition(d["ProcessType"] as? String == "Interactive")
     precondition((try? PropertyListSerialization.data(fromPropertyList: d, format: .xml, options: 0)) != nil)
+    precondition(encodedProjectDir("/Users/xklbr/Documents/projects/guachiman") == "-Users-xklbr-Documents-projects-guachiman")
+    precondition(encodedProjectDir("/a b/c.d_e") == "-a-b-c-d-e")
+    let jl = "{\"type\":\"ai-title\",\"aiTitle\":\"uno\"}\n{\"type\":\"custom-title\",\"customTitle\":\"mio\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"dos\"}\n"
+    precondition(extractSessionTitle(jl) == "mio")
+    precondition(extractSessionTitle("{\"type\":\"ai-title\",\"aiTitle\":\"uno\"}\nbasura\n{\"type\":\"ai-title\",\"aiTitle\":\"dos\"}") == "dos")
+    precondition(extractSessionTitle("{\"type\":\"user\"}\n") == nil)
+    precondition(truncatedTitle(String(repeating: "x", count: 60)).count == 50 && truncatedTitle("hola") == "hola")
     print("selftest OK")
 }
 
@@ -479,9 +592,9 @@ func runOnce() {
     func status(_ bytes: UInt64, _ cpu: Double, _ ramLimit: UInt64, _ cpuLimit: Double?) -> String {
         rowColor(bytes: bytes, cpu: cpu, ramLimit: ramLimit, cpuLimit: cpuLimit, idleFor: 0).rawValue
     }
-    print("PID\tETIQUETA\tTOTAL_MB\tESTADO\tCWD")
+    print("PID\tETIQUETA\tTITULO\tTOTAL_MB\tESTADO\tCWD")
     for s in snap.sessions {
-        print("\(s.pid)\t\(s.label)\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(s.cwd)")
+        print("\(s.pid)\t\(s.label)\t\(sessionTitle(pid: s.pid).map(truncatedTitle) ?? "-")\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(s.cwd)")
     }
     if snap.sessions.isEmpty { print("(sin sesiones de Claude)") }
     print("")
@@ -697,7 +810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let since = overSince[s.pid] ?? now
                 overSince[s.pid] = since
                 if now.timeIntervalSince(since) >= Config.sessionSustained {
-                    var text = "Sesión \(s.label) usa \(formatBytes(s.bytes)) (pid \(s.pid))"
+                    var text = "Sesión \(sessionLabel(s)) usa \(formatBytes(s.bytes)) (pid \(s.pid))"
                     if let t = s.top { text += " (mayor: \(t.cmd) \(formatBytes(t.bytes)))" }
                     if alert(key: "session:\(s.pid)", value: Double(s.bytes), text: text, now: now) {
                         appendPending(rootPid: s.pid, line: pendingLine(
@@ -750,6 +863,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for k in lastAlert.keys where k.hasPrefix("session:") {   // sesión que murió: borra su pendiente
             if let pid = pid_t(k.dropFirst(8)), !livePids.contains(pid) { removePending(rootPid: pid) }
         }
+        pruneTitleCache(live: livePids)
         lastAlert = lastAlert.filter { k, _ in
             if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
             if k.hasPrefix("orphan:") { return orphanPids.contains(pid_t(k.dropFirst(7)) ?? -1) }
@@ -863,8 +977,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for s in snap.sessions {
                 let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
                                  idleFor: lastIdle["session:\(s.pid)"] ?? 0)
-                menu.addItem(row("\(s.label) — \(formatBytes(s.bytes)) (pid \(s.pid))", c,
-                                 KillTarget(name: "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false)))
+                let title = sessionTitle(pid: s.pid).map(truncatedTitle)
+                menu.addItem(row("\(title ?? s.label) — \(formatBytes(s.bytes)) (pid \(s.pid))", c,
+                                 KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false)))
             }
             for o in snap.orphans {
                 let c = rowColor(bytes: o.bytes, cpu: o.cpu, ramLimit: Config.orphanBytes, cpuLimit: nil,
