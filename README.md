@@ -46,14 +46,23 @@ Nunca se señalan los pids 0 y 1 ni el propio Guachiman. El menú se construye a
 - **Iniciar al encender**: crea o borra `~/Library/LaunchAgents/io.github.guachiman.plist` (surte efecto en el próximo inicio de sesión). "Salir" termina con estado 0, así que no se relanza.
 - Solo se ejecuta una instancia a la vez.
 
-## Avisos a la sesión de Claude
+## Avisos a la sesión de Claude (interruptor "IA")
 
-Cuando salta una alerta de sesión o de huérfano (y no estás en pausa), Guachiman añade una línea JSON a `~/Library/Application Support/Guachiman/alerts.jsonl`. Las alertas de memoria del sistema no escriben línea. Campos:
+En la cabecera del panel, junto al engranaje, hay un botón **IA**. Está **apagado por defecto** (gris tenue) y se recuerda entre ejecuciones (`aiEnabled`). Solo funciona con Claude Code: si no está instalado, el botón queda deshabilitado ("Claude Code no está instalado").
+
+- **Apagado**: Guachiman se comporta como sin IA. No escribe `alerts.jsonl` y no hay sesión de relay.
+- **Encendido** (blanco): cuando salta una alerta de sesión o de huérfano (y no estás en pausa), Guachiman añade una línea JSON a `~/Library/Application Support/Guachiman/alerts.jsonl` y mantiene corriendo el relay: una sesión de Claude Code en segundo plano (Haiku) que lee el archivo y avisa a la sesión dueña del proceso. Las alertas de memoria del sistema no escriben línea.
+- Al encender (o al abrir la app con la IA encendida) Guachiman comprueba `claude auth status --json`. Si Claude Code no tiene sesión iniciada, no arranca el relay, el botón se pone amarillo y el panel muestra: "Inicia sesión en Claude Code: abre la terminal y ejecuta `claude`" (también llega una notificación). La comprobación se repite solo al abrir el panel; cuando pasa, el relay arranca y el botón vuelve a blanco.
+- El relay se detiene al apagar el botón y al elegir "Salir" (o al recibir SIGTERM). Sin Guachiman no tiene sentido, así que ya no hay un LaunchAgent aparte.
+- **Costo**: mientras está encendido, la sesión del relay usa unos 386 MB de RAM y gasta tokens de Haiku por alerta. Guachiman solo lanza procesos al encender, al abrir y al salir; el sondeo no cambia.
+- Requisito: el relay necesita un directorio confiable para Claude Code. Ver [relay/README.md](relay/README.md).
+
+Campos de cada línea:
 
 - Sesión: `kind` ("session"), `ts`, `pid` (raíz de Claude), `mb`, `limit_mb`, `cwd`, `title` (el título de la sesión si ya se conocía, si no `null`) y `top` (`pid`, `mb` y `cmd` del hijo más grande).
 - Huérfano: `kind` ("orphan"), `ts`, `pid`, `name`, `mb`, `limit_mb` y `cwd`.
 
-Antes de escribir, si el archivo pesa más de 1 MB se renombra a `alerts.jsonl.1` (sobrescribe el anterior). Una sesión de relay aparte, documentada en [relay/README.md](relay/README.md), lee el archivo con `tail -F` y entrega cada aviso a la sesión de Claude que corresponde. Guachiman no usa IA ni habla con Claude: solo deja el evento escrito.
+Antes de escribir, si el archivo pesa más de 1 MB se renombra a `alerts.jsonl.1` (sobrescribe el anterior). Guachiman no habla con Claude: solo deja el evento escrito.
 
 La notificación de memoria libre baja nombra a los dos mayores consumidores entre sesiones y apps ("Memoria libre baja: 14 % · mayores: Brave Browser 4,2 GB, …").
 

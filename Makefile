@@ -3,15 +3,17 @@ BIN := $(APP)/Contents/MacOS/Guachiman
 ICONS := icon/AppIcon.icns icon/MenuBarIcon.png icon/MenuBarIcon@2x.png
 ICONSET := build/AppIcon.iconset
 
-.PHONY: all run check test notify-test icon release clean relay-install relay-uninstall
+.PHONY: all run check test notify-test icon release clean
 
 all: $(BIN)
 
-$(BIN): guachiman.swift Info.plist $(ICONS)
+$(BIN): guachiman.swift Info.plist $(ICONS) relay/start.sh relay/brief.md
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	swiftc -O -target $$(uname -m)-apple-macos13.0 guachiman.swift -o $(BIN)
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp $(ICONS) $(APP)/Contents/Resources/
+	mkdir -p $(APP)/Contents/Resources/relay
+	cp relay/start.sh relay/brief.md $(APP)/Contents/Resources/relay/
 	codesign -s - --force $(APP)
 
 # Regenera los íconos desde icon/*.svg. No forma parte del build normal.
@@ -41,23 +43,6 @@ notify-test: all
 release:
 	@[ -n "$(VERSION)" ] || { echo "Uso: make release VERSION=x.y.z [DRY_RUN=1]" >&2; exit 1; }
 	@scripts/release.sh "$(VERSION)"
-
-RELAY_DIR := $(HOME)/Library/Application Support/Guachiman/relay
-RELAY_PLIST := $(HOME)/Library/LaunchAgents/io.github.guachiman.relay.plist
-
-# Relay de alertas (sesión de Claude Code en segundo plano). Ver relay/README.md.
-relay-install:
-	mkdir -p $(HOME)/Library/LaunchAgents "$(RELAY_DIR)"
-	/bin/cp relay/start.sh relay/brief.md "$(RELAY_DIR)/"
-	sed -e 's|@START@|$(RELAY_DIR)/start.sh|g' -e 's|@CWD@|$(CURDIR)|g' -e 's|@HOME@|$(HOME)|g' relay/io.github.guachiman.relay.plist > $(RELAY_PLIST)
-	-launchctl bootout gui/$$(id -u) $(RELAY_PLIST) 2>/dev/null
-	launchctl bootstrap gui/$$(id -u) $(RELAY_PLIST)
-
-relay-uninstall:
-	-launchctl bootout gui/$$(id -u) $(RELAY_PLIST) 2>/dev/null
-	rm -f $(RELAY_PLIST)
-	rm -rf "$(RELAY_DIR)"
-	-for f in $(HOME)/.claude/sessions/*.json; do grep -q '"name":"guachiman-relay"' $$f && $(HOME)/.local/bin/claude stop $$(sed -n 's/.*"jobId":"\([^"]*\)".*/\1/p' $$f); done; true
 
 clean:
 	rm -rf build

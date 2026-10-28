@@ -28,6 +28,8 @@ enum Config {
     static let warnFraction = 0.75               // amarillo: >= 75 % de un umbral
     static let pauseDuration: TimeInterval = 3600
     static let autoCloseKey = "autoCloseOrphans"
+    static let aiKey = "aiEnabled"
+    static let loginText = "Inicia sesión en Claude Code: abre la terminal y ejecuta `claude`"
     static let agentLabel = "io.github.guachiman"
     static let supportDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Guachiman").path
@@ -202,6 +204,56 @@ func appendAlert(_ line: String, path: String = Config.alertsFile, maxBytes: Int
     close(fd)
 }
 
+// MARK: - Relay de IA (sesión de Claude Code en segundo plano; solo se lanzan procesos al activar, arrancar o salir)
+
+/// Ruta del CLI de Claude Code (launchd trae un PATH mínimo, así que se buscan las ubicaciones habituales).
+func claudeBinary() -> String? {
+    let home = NSHomeDirectory()
+    return [home + "/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        .first { FileManager.default.isExecutableFile(atPath: $0) }
+}
+
+/// Interpreta la salida de `claude auth status --json`: true solo si `loggedIn` es true.
+func parseAuthLoggedIn(_ data: Data) -> Bool {
+    ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["loggedIn"] as? Bool ?? false
+}
+
+/// `claude auth status --json` (~0.2 s). Error, salida no válida o código distinto de 0 cuentan como "sin sesión".
+func claudeLoggedIn(_ claude: String) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: claude)
+    p.arguments = ["auth", "status", "--json"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return false }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return p.terminationStatus == 0 && parseAuthLoggedIn(data)
+}
+
+/// Ejecuta `start.sh [arg]` del bundle; con `wait` espera a que termine (para detener al salir).
+func runRelay(_ arg: String?, wait: Bool) {
+    guard let claude = claudeBinary(),
+          let script = Bundle.main.resourcePath.map({ $0 + "/relay/start.sh" }),
+          FileManager.default.fileExists(atPath: script) else { return }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = [script] + (arg.map { [$0] } ?? [])
+    // Entorno mínimo: si Guachiman se lanzó desde una sesión de Claude Code heredaría su entorno y el relay no arrancaría limpio.
+    let home = NSHomeDirectory()
+    let env: [String: String] = ["HOME": home, "USER": NSUserName(), "LOGNAME": NSUserName(), "TMPDIR": NSTemporaryDirectory(),
+               "PATH": "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "CLAUDE_BIN": claude]
+        .merging(ProcessInfo.processInfo.environment["RELAY_CWD"].map { ["RELAY_CWD": $0] } ?? [:]) { a, _ in a }
+    p.environment = env
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return }
+    if wait { p.waitUntilExit() }
+}
+
 /// Texto de memoria libre baja con los 2 mayores consumidores (sesiones y apps) por RAM.
 func systemLowText(freePercent: Int, consumers: [(name: String, bytes: UInt64)]) -> String {
     var t = "Memoria libre baja: \(freePercent) %"
@@ -320,6 +372,10 @@ func pruneTitleCache(live: Set<pid_t>) { titleCache = titleCache.filter { live.c
 func sessionLabel(_ s: Session) -> String { sessionTitle(pid: s.pid).map(truncatedTitle) ?? s.label }
 
 func runSelfTest() {
+    precondition(parseAuthLoggedIn(Data(#"{"loggedIn":true,"authMethod":"claude.ai"}"#.utf8)))
+    precondition(!parseAuthLoggedIn(Data(#"{"loggedIn":false}"#.utf8)))
+    precondition(!parseAuthLoggedIn(Data("basura".utf8)))
+    precondition(!parseAuthLoggedIn(Data(#"{"loggedIn":"true"}"#.utf8)))
     var top: TopChild?
     top = largerChild(top, pid: 10, bytes: 999, root: 10)            // la raíz no cuenta
     precondition(top == nil)
@@ -891,6 +947,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         get { UserDefaults.standard.bool(forKey: Config.autoCloseKey) }
         set { UserDefaults.standard.set(newValue, forKey: Config.autoCloseKey) }
     }
+    private var aiEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: Config.aiKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Config.aiKey) }
+    }
+    private var aiLoginFailed = false
+    private var termSource: DispatchSourceSignal?
     private var lastAlert: [String: (date: Date, value: Double)] = [:]
     private var timer: Timer?
 
@@ -902,6 +964,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Limpieza única del directorio `pending/` de versiones anteriores (inofensiva si no existe).
         try? FileManager.default.removeItem(atPath: Config.supportDir + "/pending")
+        _ = ensureRelay()
+        // SIGTERM (p. ej. `brew services stop`): detiene el relay antes de salir.
+        signal(SIGTERM, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        src.setEventHandler { [weak self] in self?.quit() }
+        src.resume()
+        termSource = src
         cpuTicksPrev = cpuTicks()   // base para que el primer sondeo ya muestre CPU total
         let wantsTest = CommandLine.arguments.contains("--notify-test")
         notifier.start { [weak self] in
@@ -961,7 +1030,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if now.timeIntervalSince(since) >= Config.sessionSustained {
                     var text = "Sesión \(sessionLabel(s)) usa \(formatBytes(s.bytes)) (pid \(s.pid))"
                     if let t = s.top { text += " (mayor: \(t.cmd) \(formatBytes(t.bytes)))" }
-                    if alert(key: "session:\(s.pid)", value: Double(s.bytes), text: text, now: now) {
+                    if alert(key: "session:\(s.pid)", value: Double(s.bytes), text: text, now: now), aiEnabled {
                         appendAlert(sessionAlertLine(
                             ts: Int(now.timeIntervalSince1970), pid: s.pid, mb: s.bytes / 1_048_576,
                             limitMB: limit / 1_048_576, cwd: s.cwd, title: cachedSessionTitle(pid: s.pid), top: s.top))
@@ -983,7 +1052,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if dur >= Config.orphanAlertAfter {
                 orphanOver = true
                 if alert(key: "orphan:\(o.pid)", value: Double(o.bytes),
-                         text: "Huérfano \(o.name) usa \(formatBytes(o.bytes)) (pid \(o.pid))", now: now) {
+                         text: "Huérfano \(o.name) usa \(formatBytes(o.bytes)) (pid \(o.pid))", now: now), aiEnabled {
                     appendAlert(orphanAlertLine(
                         ts: Int(now.timeIntervalSince1970), pid: o.pid, name: o.name, mb: o.bytes / 1_048_576,
                         limitMB: Config.orphanBytes / 1_048_576, cwd: currentDirectory(o.pid) ?? ""))
@@ -1072,7 +1141,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func quit() { exit(0) }   // status 0: KeepAlive { SuccessfulExit = false } no relanza
+    func applicationWillTerminate(_ notification: Notification) { runRelay("stop", wait: true) }
+
+    @objc private func quit() {
+        runRelay("stop", wait: true)
+        exit(0)
+    }
+
+    /// Con la IA activa y Claude Code con sesión, arranca el relay (idempotente). Devuelve false si falta la sesión.
+    private func ensureRelay() -> Bool {
+        guard aiEnabled, let claude = claudeBinary() else { return true }
+        aiLoginFailed = !claudeLoggedIn(claude)
+        if !aiLoginFailed { runRelay(nil, wait: false) }
+        return !aiLoginFailed
+    }
+
+    @objc private func toggleAI(_ sender: NSButton) {
+        aiEnabled.toggle()
+        if aiEnabled {
+            if !ensureRelay() { notifier.send(Config.loginText) }
+        } else {
+            aiLoginFailed = false
+            runRelay("stop", wait: false)
+        }
+        if let p = panel { fillPanel(p) }
+    }   // status 0: KeepAlive { SuccessfulExit = false } no relanza
 
     private func toggle(_ title: String, _ action: Selector, on: Bool) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -1148,6 +1241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         p.isReleasedWhenClosed = false
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel = p
+        if aiEnabled, aiLoginFailed { _ = ensureRelay() }   // reintento solo al abrir el panel
         fillPanel(p)
         p.alphaValue = 0
         p.makeKeyAndOrderFront(nil)
@@ -1189,7 +1283,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let orphans = Array(snap.orphans.prefix(4))
         let apps = Array(snap.apps.prefix(5))
         let rightRows = apps.count + (orphans.isEmpty ? 0 : orphans.count + 1)
-        let H = max(170, rowsTop + CGFloat(max(max(sessions.count, 1), rightRows)) * rowH + 18)
+        let notice = aiEnabled && aiLoginFailed
+        let H = max(170, rowsTop + CGFloat(max(max(sessions.count, 1), rightRows)) * rowH + 18) + (notice ? 16 : 0)
 
         let root = FlippedView(frame: NSRect(x: 0, y: 0, width: W, height: H))
         root.wantsLayer = true
@@ -1283,6 +1378,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         gear.target = self
         gear.action = #selector(showSettings(_:))
         root.addSubview(gear)
+
+        // Interruptor de IA (relay con Haiku), a la izquierda del engranaje.
+        let ai = NSButton(frame: NSRect(x: W - 68, y: 10, width: 28, height: 22))
+        ai.attributedTitle = NSAttributedString(string: "IA", attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .bold)])
+        ai.isBordered = false
+        let hasClaude = claudeBinary() != nil
+        ai.isEnabled = hasClaude
+        ai.contentTintColor = !hasClaude || !aiEnabled ? .tertiaryLabelColor : (aiLoginFailed ? .systemYellow : .labelColor)
+        ai.toolTip = !hasClaude ? "Claude Code no está instalado"
+            : (notice ? Config.loginText : "IA: avisar a la sesión de Claude dueña (enlace con Haiku)")
+        ai.setAccessibilityLabel("IA: avisar a la sesión de Claude dueña (enlace con Haiku)")
+        ai.target = self
+        ai.action = #selector(toggleAI(_:))
+        root.addSubview(ai)
+        if notice {
+            let l = panelLabel(Config.loginText, size: 11, frame: NSRect(x: 16, y: H - 22, width: W - 32, height: 16))
+            l.textColor = .systemYellow
+            root.addSubview(l)
+        }
 
         p.contentView = root
         // Centrado bajo el ícono y recortado a la zona visible de la pantalla.

@@ -22,26 +22,23 @@ Una sesión de Claude Code en segundo plano (Haiku) que lee las alertas de memor
 
 ## Costo
 
-- Unos 300-400 MB de RAM mientras corre.
+- Unos 386 MB de RAM mientras el botón IA está encendido.
 - Tokens de Haiku por cada alerta y por cada re-armado del monitor (máximo cada 30 min).
 
-## Instalar y desinstalar
+## Cómo se activa
 
-```sh
-make relay-install     # copia start.sh y brief.md a ~/Library/Application Support/Guachiman/relay,
-                       # escribe el LaunchAgent y lo carga con launchctl; arranca al iniciar sesión
-make relay-uninstall   # bootout, borra el plist y la copia, y detiene la sesión del relay
-```
+Lo gestiona Guachiman con el botón **IA** del panel (apagado por defecto). Al encender, o al abrir la app con la IA encendida, ejecuta `/bin/bash <app>/Contents/Resources/relay/start.sh`; al apagar o al "Salir" ejecuta `start.sh stop`. `make` copia `start.sh` y `brief.md` dentro del bundle, así que las instalaciones con Homebrew también los traen. Ya no existe el LaunchAgent del relay.
+
+Si vienes de la versión anterior y la instalaste a mano: `launchctl bootout gui/$(id -u)/io.github.guachiman.relay`, borra `~/Library/LaunchAgents/io.github.guachiman.relay.plist` y `~/Library/Application Support/Guachiman/relay`.
 
 Notas:
-- Se copia fuera de `~/Documents` porque launchd no tiene permiso para ejecutar scripts ahí.
-- La sesión corre con el directorio del repo como `cwd`, que debe ser un workspace ya confiable para Claude Code (de lo contrario no arranca: "Workspace not trusted"). Revisa `/tmp/guachiman-relay.log`.
-- `start.sh` es idempotente: si ya hay una sesión `guachiman-relay` viva, no hace nada. Al reinstalar con una sesión viva se conserva la anterior (usa `claude stop <id>` antes si quieres recargar `brief.md`).
+- Guachiman busca el CLI en `~/.local/bin/claude`, `/opt/homebrew/bin/claude` y `/usr/local/bin/claude` y se lo pasa al script en `CLAUDE_BIN`. Antes de arrancar comprueba `claude auth status --json`; sin sesión iniciada avisa en el panel y no arranca.
+- **Limitación de confianza**: `claude --bg` se niega a correr en un workspace no confiable y no existe una opción para saltarlo. El relay usa `~/Library/Application Support/Guachiman/relay-cwd` (o `RELAY_CWD`): ejecuta `claude` una vez en ese directorio y acepta la confianza. Mientras no lo hagas, el relay no arranca. No se usan carpetas protegidas como `~/Documents`, porque sin permiso de TCC la app queda colgada al entrar en ellas.
+- `start.sh` es idempotente: si ya hay una sesión `guachiman-relay` viva, no hace nada. Para recargar `brief.md`, apaga y enciende el botón IA.
 
 ## Verificar que corre
 
 ```sh
-launchctl print gui/$(id -u)/io.github.guachiman.relay | grep -E "state|last exit"
 claude agents --json | grep -B4 -A3 guachiman-relay
 claude logs <id>       # el id sale de `claude agents --json` / ~/.claude/sessions/<pid>.json (jobId)
 ps aux | grep 'tail -n 0 -F' | grep alerts.jsonl   # el monitor armado
