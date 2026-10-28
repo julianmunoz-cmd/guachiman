@@ -26,6 +26,8 @@ enum Config {
     static let pauseDuration: TimeInterval = 3600
     static let autoCloseKey = "autoCloseOrphans"
     static let agentLabel = "io.github.guachiman"
+    static let pendingDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Guachiman/pending").path
 }
 
 // MARK: - Lógica pura (cubierta por --selftest)
@@ -87,7 +89,69 @@ func launchAgentPlist(executable: String) -> [String: Any] {
      "ProcessType": "Interactive"]
 }
 
+/// Hijo más grande (por RSS) de una sesión; el pid raíz nunca cuenta.
+struct TopChild: Equatable {
+    var pid: pid_t
+    var bytes: UInt64
+    var cmd = ""
+}
+
+func largerChild(_ cur: TopChild?, pid: pid_t, bytes: UInt64, root: pid_t) -> TopChild? {
+    guard pid != root, bytes > (cur?.bytes ?? 0) else { return cur }
+    return TopChild(pid: pid, bytes: bytes)
+}
+
+/// Nombre corto del comando: último componente de argv[0], o del ejecutable; máx. 80.
+func commandName(argv0: String?, exe: String?) -> String {
+    for c in [argv0, exe] {
+        guard let c, !c.isEmpty else { continue }
+        let n = (c as NSString).lastPathComponent
+        if !n.isEmpty { return String(n.prefix(80)) }
+    }
+    return "?"
+}
+
+/// Una línea JSON (sin salto de línea) para `pending/<pid>.jsonl`.
+func pendingLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, top: TopChild?) -> String {
+    var d: [String: Any] = ["ts": ts, "pid": Int(pid), "mb": mb, "limit_mb": limitMB, "cwd": cwd]
+    if let top { d["top"] = ["pid": Int(top.pid), "mb": top.bytes / 1_048_576, "cmd": top.cmd] as [String: Any] }
+    let data = (try? JSONSerialization.data(withJSONObject: d, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
+    return String(decoding: data, as: UTF8.self)
+}
+
+/// Añade una línea al archivo pendiente de la sesión; crea el directorio al vuelo, cierra al instante, ignora errores.
+func appendPending(rootPid: pid_t, line: String) {
+    try? FileManager.default.createDirectory(atPath: Config.pendingDir, withIntermediateDirectories: true)
+    let fd = open("\(Config.pendingDir)/\(rootPid).jsonl", O_WRONLY | O_APPEND | O_CREAT, 0o600)
+    guard fd >= 0 else { return }
+    let bytes = Array((line + "\n").utf8)
+    _ = write(fd, bytes, bytes.count)
+    close(fd)
+}
+
+func removePending(rootPid: pid_t) { unlink("\(Config.pendingDir)/\(rootPid).jsonl") }
+
 func runSelfTest() {
+    var top: TopChild?
+    top = largerChild(top, pid: 10, bytes: 999, root: 10)            // la raíz no cuenta
+    precondition(top == nil)
+    top = largerChild(top, pid: 11, bytes: 100, root: 10)
+    top = largerChild(top, pid: 12, bytes: 300, root: 10)
+    top = largerChild(top, pid: 13, bytes: 200, root: 10)
+    precondition(top == TopChild(pid: 12, bytes: 300))
+    precondition(commandName(argv0: "/usr/bin/node", exe: "/x/y") == "node")
+    precondition(commandName(argv0: nil, exe: "/x/vitest") == "vitest")
+    precondition(commandName(argv0: nil, exe: nil) == "?")
+    precondition(commandName(argv0: String(repeating: "a", count: 200), exe: nil).count == 80)
+    let line = pendingLine(ts: 5, pid: 7, mb: 2048, limitMB: 1024, cwd: "/a \"b\"/c",
+                           top: TopChild(pid: 9, bytes: 3 * 1_048_576, cmd: "vitest"))
+    let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+    precondition(!line.contains("\n") && obj?["pid"] as? Int == 7 && obj?["limit_mb"] as? Int == 1024)
+    precondition(obj?["cwd"] as? String == "/a \"b\"/c")
+    let tj = obj?["top"] as? [String: Any]
+    precondition(tj?["pid"] as? Int == 9 && tj?["mb"] as? Int == 3 && tj?["cmd"] as? String == "vitest")
+    precondition((try? JSONSerialization.jsonObject(with: Data(pendingLine(ts: 1, pid: 1, mb: 1, limitMB: 1, cwd: "", top: nil).utf8)) as? [String: Any])?["top"] == nil)
+
     precondition(Orphan.name(exe: "/usr/local/bin/node", argv0: nil) == "node")
     precondition(Orphan.name(exe: "/x/y", argv0: "next-server (v14)") == "next-server")
     precondition(Orphan.name(exe: nil, argv0: "playwright-core run") == "playwright-core")
@@ -147,6 +211,7 @@ struct Session {
     let label: String
     let cwd: String
     let bytes: UInt64
+    var top: TopChild? = nil   // solo si supera el umbral
 }
 
 struct OrphanProc {
@@ -259,6 +324,8 @@ func currentDirectory(_ pid: pid_t) -> String? {
     }
 }
 
+private let sessionLimitBytes = UInt64(Double(physicalMemory()) * Config.sessionFraction)
+
 func takeSnapshot() -> Snapshot {
     var parents: [pid_t: pid_t] = [:]
     var children: [pid_t: [pid_t]] = [:]
@@ -300,10 +367,20 @@ func takeSnapshot() -> Snapshot {
     for root in roots {
         let pids = tree(root)
         sessionPids.formUnion(pids)
-        let total = pids.reduce(UInt64(0)) { $0 + (residentSize($1) ?? 0) }
+        var total: UInt64 = 0
+        var best: TopChild?
+        for p in pids {
+            let r = residentSize(p) ?? 0
+            total += r
+            best = largerChild(best, pid: p, bytes: r, root: root)
+        }
         let cwd = currentDirectory(root) ?? ""
         let label = cwd.isEmpty ? "?" : (cwd as NSString).lastPathComponent
-        sessions.append(Session(pid: root, label: label, cwd: cwd, bytes: total))
+        if total > sessionLimitBytes, var b = best {   // solo sesiones sobre el umbral pagan estas lecturas
+            b.cmd = commandName(argv0: argv0(b.pid), exe: executablePath(b.pid))
+            best = b
+        } else { best = nil }
+        sessions.append(Session(pid: root, label: label, cwd: cwd, bytes: total, top: best))
     }
     sessions.sort { $0.bytes > $1.bytes }
 
@@ -444,6 +521,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Pendientes de una ejecución anterior ya no valen (y harían lento al hook): se vuelve a avisar si sigue el problema.
+        try? FileManager.default.removeItem(atPath: Config.pendingDir)
         let wantsTest = CommandLine.arguments.contains("--notify-test")
         notifier.start { [weak self] in
             guard let self else { return }
@@ -485,8 +564,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let since = overSince[s.pid] ?? now
                 overSince[s.pid] = since
                 if now.timeIntervalSince(since) >= Config.sessionSustained {
-                    let text = "Sesión \(s.label) usa \(formatBytes(s.bytes)) (pid \(s.pid))"
-                    alert(key: "session:\(s.pid)", value: Double(s.bytes), text: text, now: now)
+                    var text = "Sesión \(s.label) usa \(formatBytes(s.bytes)) (pid \(s.pid))"
+                    if let t = s.top { text += " (mayor: \(t.cmd) \(formatBytes(t.bytes)))" }
+                    if alert(key: "session:\(s.pid)", value: Double(s.bytes), text: text, now: now) {
+                        appendPending(rootPid: s.pid, line: pendingLine(
+                            ts: Int(now.timeIntervalSince1970), pid: s.pid, mb: s.bytes / 1_048_576,
+                            limitMB: limit / 1_048_576, cwd: s.cwd, top: s.top))
+                    }
                 }
             } else {
                 overSince[s.pid] = nil
@@ -530,6 +614,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                       text: "\(a.name) usa \(Int(a.cpu.rounded())) % de CPU sostenido", now: now)
             }
         }
+        for k in lastAlert.keys where k.hasPrefix("session:") {   // sesión que murió: borra su pendiente
+            if let pid = pid_t(k.dropFirst(8)), !livePids.contains(pid) { removePending(rootPid: pid) }
+        }
         lastAlert = lastAlert.filter { k, _ in
             if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
             if k.hasPrefix("orphan:") { return orphanPids.contains(pid_t(k.dropFirst(7)) ?? -1) }
@@ -555,15 +642,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notifier.send("Cerrado huérfano \(fresh.name) (\(formatBytes(fresh.bytes)), pid \(fresh.pid))")
     }
 
-    private func alert(key: String, value: Double, text: String, now: Date) {
-        guard !pauseActive(until: pausedUntil, now: now) else { return }
+    /// Devuelve true si la alerta realmente se disparó (no pausa, no enfriamiento).
+    @discardableResult
+    private func alert(key: String, value: Double, text: String, now: Date) -> Bool {
+        guard !pauseActive(until: pausedUntil, now: now) else { return false }
         if let last = lastAlert[key] {
             let cooled = now.timeIntervalSince(last.date) >= Config.cooldown
             let grew = value > last.value * Config.regrowthFactor
-            guard cooled || grew else { return }
+            guard cooled || grew else { return false }
         }
         lastAlert[key] = (now, value)
         notifier.send(text)
+        return true
     }
 
     @objc private func toggleAutoClose() { autoClose.toggle(); refreshMenu() }

@@ -28,6 +28,25 @@ Un candidato a huérfano es un proceso con `ppid == 1` cuyo nombre (del ejecutab
 - **Iniciar al encender**: crea o borra `~/Library/LaunchAgents/io.github.guachiman.plist` (surte efecto en el próximo inicio de sesión). "Salir" termina con estado 0, así que no se relanza.
 - Solo se ejecuta una instancia a la vez.
 
+## Avisos a la sesión de Claude
+
+Cuando salta una alerta de sesión (y no estás en pausa), Guachiman añade una línea JSON a `~/Library/Application Support/Guachiman/pending/<pid de la sesión>.jsonl` con la RAM de la sesión, el umbral, el directorio y el proceso hijo más grande (`top`: pid, MB y comando). La notificación también nombra a ese hijo ("mayor: vitest 1,8 GB"). Si la sesión termina, su archivo se borra.
+
+El hook `~/.claude/hooks/guachiman-alerts.sh` (PostToolUse) busca el archivo de la sesión que lo ejecuta, lo consume y entrega a Claude un aviso corto como contexto adicional, para que cierre el proceso que sobra o acote las pruebas y te cuente qué hizo.
+
+Para instalarlo, copia el script a `~/.claude/hooks/`, hazlo ejecutable y añade esto en `hooks.PostToolUse` de `~/.claude/settings.json`:
+
+```json
+{
+  "matcher": "Bash",
+  "hooks": [
+    { "type": "command", "command": "$HOME/.claude/hooks/guachiman-alerts.sh", "timeout": 5 }
+  ]
+}
+```
+
+Diseño eficiente: Guachiman no suma timers, hilos ni watchers; el hijo mayor sale de las lecturas que ya hace en cada sondeo y solo se resuelve su nombre en sesiones sobre el umbral, y el archivo se escribe únicamente cuando la alerta se dispara. El hook, sin avisos pendientes, termina con un glob de bash y sin lanzar ningún proceso.
+
 ## Qué no hace
 
 Por defecto es de solo lectura: no envía señales a ningún proceso. Solo cierra huérfanos si tú activas "Cerrar huérfanos automáticamente", y nunca toca sesiones de Claude.
