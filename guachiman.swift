@@ -1703,8 +1703,12 @@ if CommandLine.arguments.contains("--once") {
     exit(0)
 }
 
+// Desde el symlink de Homebrew (bin/guachiman) Bundle.main no es el .app: se resuelve el ejecutable real.
+let cliResources = Bundle.main.executableURL!.resolvingSymlinksInPath()
+    .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources").path
+
 if CommandLine.arguments.contains("--uninstall") {
-    guard let script = Bundle.main.resourcePath.map({ $0 + "/uninstall.sh" }),
+    guard let script = Optional(cliResources + "/uninstall.sh"),
           FileManager.default.fileExists(atPath: script) else {
         FileHandle.standardError.write(Data("guachiman: no se encontró uninstall.sh en el bundle\n".utf8))
         exit(1)
@@ -1718,7 +1722,7 @@ if CommandLine.arguments.contains("--uninstall") {
 }
 
 if CommandLine.arguments.contains("--update") {
-    guard let script = Bundle.main.resourcePath.map({ $0 + "/update.sh" }),
+    guard let script = Optional(cliResources + "/update.sh"),
           FileManager.default.fileExists(atPath: script) else {
         FileHandle.standardError.write(Data("guachiman: no se encontró update.sh en el bundle\n".utf8))
         exit(1)
