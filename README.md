@@ -48,22 +48,16 @@ Nunca se señalan los pids 0 y 1 ni el propio Guachiman. El menú se construye a
 
 ## Avisos a la sesión de Claude
 
-Cuando salta una alerta de sesión (y no estás en pausa), Guachiman añade una línea JSON a `~/Library/Application Support/Guachiman/pending/<pid de la sesión>.jsonl` con la RAM de la sesión, el umbral, el directorio y el proceso hijo más grande (`top`: pid, MB y comando). La notificación también nombra a ese hijo ("mayor: vitest 1,8 GB"). Si la sesión termina, su archivo se borra.
+Cuando salta una alerta de sesión o de huérfano (y no estás en pausa), Guachiman añade una línea JSON a `~/Library/Application Support/Guachiman/alerts.jsonl`. Las alertas de memoria del sistema no escriben línea. Campos:
 
-El hook `~/.claude/hooks/guachiman-alerts.sh` (PostToolUse) busca el archivo de la sesión que lo ejecuta, lo consume y entrega a Claude un aviso corto como contexto adicional, para que cierre el proceso que sobra o acote las pruebas y te cuente qué hizo.
+- Sesión: `kind` ("session"), `ts`, `pid` (raíz de Claude), `mb`, `limit_mb`, `cwd`, `title` (el título de la sesión si ya se conocía, si no `null`) y `top` (`pid`, `mb` y `cmd` del hijo más grande).
+- Huérfano: `kind` ("orphan"), `ts`, `pid`, `name`, `mb`, `limit_mb` y `cwd`.
 
-Para instalarlo, copia el script a `~/.claude/hooks/`, hazlo ejecutable y añade esto en `hooks.PostToolUse` de `~/.claude/settings.json`:
+Antes de escribir, si el archivo pesa más de 1 MB se renombra a `alerts.jsonl.1` (sobrescribe el anterior). Una sesión de relay aparte, documentada en [relay/README.md](relay/README.md), lee el archivo con `tail -F` y entrega cada aviso a la sesión de Claude que corresponde. Guachiman no usa IA ni habla con Claude: solo deja el evento escrito.
 
-```json
-{
-  "matcher": "Bash",
-  "hooks": [
-    { "type": "command", "command": "$HOME/.claude/hooks/guachiman-alerts.sh", "timeout": 5 }
-  ]
-}
-```
+La notificación de memoria libre baja nombra a los dos mayores consumidores entre sesiones y apps ("Memoria libre baja: 14 % · mayores: Brave Browser 4,2 GB, …").
 
-Diseño eficiente: Guachiman no suma timers, hilos ni watchers; el hijo mayor sale de las lecturas que ya hace en cada sondeo y solo se resuelve su nombre en sesiones sobre el umbral, y el archivo se escribe únicamente cuando la alerta se dispara. El hook, sin avisos pendientes, termina con un glob de bash y sin lanzar ningún proceso.
+Diseño eficiente: Guachiman no suma timers, hilos ni watchers; el hijo mayor y los consumidores salen de las lecturas que ya hace en cada sondeo, y el archivo se abre, se escribe y se cierra solo cuando una alerta se dispara.
 
 ## Qué no hace
 

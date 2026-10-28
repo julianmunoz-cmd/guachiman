@@ -1,7 +1,7 @@
 // Guachiman — menu bar app que vigila la RAM y la CPU de todas las apps, además de
 // las sesiones de Claude Code y los procesos huérfanos.
 // Solo cierra procesos cuando el usuario lo confirma con el botón de detener de cada fila
-// del menú, o con SIGTERM a huérfanos (ppid 1: node, vitest, next, playwright) si activa
+// del panel, o con SIGTERM a huérfanos (ppid 1: node, vitest, next, playwright) si activa
 // "Cerrar huérfanos automáticamente" (apagado de fábrica).
 
 import AppKit
@@ -29,8 +29,9 @@ enum Config {
     static let pauseDuration: TimeInterval = 3600
     static let autoCloseKey = "autoCloseOrphans"
     static let agentLabel = "io.github.guachiman"
-    static let pendingDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Guachiman/pending").path
+    static let supportDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Guachiman").path
+    static let alertsFile = supportDir + "/alerts.jsonl"
 }
 
 // MARK: - Lógica pura (cubierta por --selftest)
@@ -93,6 +94,36 @@ func rowColor(bytes: UInt64, cpu: Double, ramLimit: UInt64, cpuLimit: Double?, i
     return .green
 }
 
+/// Color del anillo de memoria libre con la misma regla que las filas: rojo bajo el mínimo,
+/// amarillo si lo usado llega al 75 % del umbral de uso, verde en otro caso.
+func freeMemoryColor(freePercent: Int) -> RowColor {
+    let usedLimit = Double(100 - Config.systemFreeMinPercent)
+    if freePercent < Config.systemFreeMinPercent { return .red }
+    if Double(100 - freePercent) >= Config.warnFraction * usedLimit { return .yellow }
+    return .green
+}
+
+/// % de CPU total de la máquina entre dos lecturas de ticks (ocupado / total).
+func cpuLoadPercent(prev: (busy: UInt64, total: UInt64), cur: (busy: UInt64, total: UInt64)) -> Double {
+    guard cur.total > prev.total, cur.busy >= prev.busy else { return 0 }
+    return min(100, Double(cur.busy - prev.busy) / Double(cur.total - prev.total) * 100)
+}
+
+private let hostPort = mach_host_self()
+
+/// Una sola llamada a host_statistics: ticks ocupados (user+system+nice) y totales.
+func cpuTicks() -> (busy: UInt64, total: UInt64)? {
+    var info = host_cpu_load_info()
+    var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics(hostPort, HOST_CPU_LOAD_INFO, $0, &count) }
+    }
+    guard kr == KERN_SUCCESS else { return nil }
+    let t = info.cpu_ticks
+    let busy = UInt64(t.0) + UInt64(t.1) + UInt64(t.3)
+    return (busy, busy + UInt64(t.2))
+}
+
 func pauseActive(until: Date?, now: Date) -> Bool {
     guard let until else { return false }
     return now < until
@@ -128,25 +159,44 @@ func commandName(argv0: String?, exe: String?) -> String {
     return "?"
 }
 
-/// Una línea JSON (sin salto de línea) para `pending/<pid>.jsonl`.
-func pendingLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, top: TopChild?) -> String {
-    var d: [String: Any] = ["ts": ts, "pid": Int(pid), "mb": mb, "limit_mb": limitMB, "cwd": cwd]
-    if let top { d["top"] = ["pid": Int(top.pid), "mb": top.bytes / 1_048_576, "cmd": top.cmd] as [String: Any] }
+func jsonLine(_ d: [String: Any]) -> String {
     let data = (try? JSONSerialization.data(withJSONObject: d, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
     return String(decoding: data, as: UTF8.self)
 }
 
-/// Añade una línea al archivo pendiente de la sesión; crea el directorio al vuelo, cierra al instante, ignora errores.
-func appendPending(rootPid: pid_t, line: String) {
-    try? FileManager.default.createDirectory(atPath: Config.pendingDir, withIntermediateDirectories: true)
-    let fd = open("\(Config.pendingDir)/\(rootPid).jsonl", O_WRONLY | O_APPEND | O_CREAT, 0o600)
+/// Línea de `alerts.jsonl` para una sesión que superó el umbral.
+func sessionAlertLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, title: String?, top: TopChild?) -> String {
+    var d: [String: Any] = ["kind": "session", "ts": ts, "pid": Int(pid), "mb": mb, "limit_mb": limitMB,
+                            "cwd": cwd, "title": title ?? NSNull()]
+    d["top"] = top.map { ["pid": Int($0.pid), "mb": $0.bytes / 1_048_576, "cmd": $0.cmd] as [String: Any] } ?? NSNull()
+    return jsonLine(d)
+}
+
+/// Línea de `alerts.jsonl` para un huérfano.
+func orphanAlertLine(ts: Int, pid: pid_t, name: String, mb: UInt64, limitMB: UInt64, cwd: String) -> String {
+    jsonLine(["kind": "orphan", "ts": ts, "pid": Int(pid), "name": name, "mb": mb, "limit_mb": limitMB, "cwd": cwd])
+}
+
+/// Añade una línea al archivo de eventos; rota a `.1` si pasa de 1 MB (un solo stat), crea el directorio al vuelo,
+/// cierra al instante, ignora errores.
+func appendAlert(_ line: String, path: String = Config.alertsFile, maxBytes: Int = 1_048_576) {
+    try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+    var st = stat()
+    if stat(path, &st) == 0, Int(st.st_size) > maxBytes { rename(path, path + ".1") }
+    let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
     guard fd >= 0 else { return }
     let bytes = Array((line + "\n").utf8)
     _ = write(fd, bytes, bytes.count)
     close(fd)
 }
 
-func removePending(rootPid: pid_t) { unlink("\(Config.pendingDir)/\(rootPid).jsonl") }
+/// Texto de memoria libre baja con los 2 mayores consumidores (sesiones y apps) por RAM.
+func systemLowText(freePercent: Int, consumers: [(name: String, bytes: UInt64)]) -> String {
+    var t = "Memoria libre baja: \(freePercent) %"
+    let top = consumers.sorted { $0.bytes > $1.bytes }.prefix(2)
+    if !top.isEmpty { t += " · mayores: " + top.map { "\($0.name) \(formatBytes($0.bytes))" }.joined(separator: ", ") }
+    return t
+}
 
 // MARK: - Título de sesión de Claude Code
 
@@ -249,6 +299,9 @@ func sessionTitle(pid: pid_t) -> String? {
     return title
 }
 
+/// Título ya conocido, sin leer disco.
+func cachedSessionTitle(pid: pid_t) -> String? { titleCache[pid]?.title }
+
 func pruneTitleCache(live: Set<pid_t>) { titleCache = titleCache.filter { live.contains($0.key) } }
 
 /// Etiqueta visible: título de Claude Code (máx. 50) o, sin él, la carpeta.
@@ -266,14 +319,31 @@ func runSelfTest() {
     precondition(commandName(argv0: nil, exe: "/x/vitest") == "vitest")
     precondition(commandName(argv0: nil, exe: nil) == "?")
     precondition(commandName(argv0: String(repeating: "a", count: 200), exe: nil).count == 80)
-    let line = pendingLine(ts: 5, pid: 7, mb: 2048, limitMB: 1024, cwd: "/a \"b\"/c",
-                           top: TopChild(pid: 9, bytes: 3 * 1_048_576, cmd: "vitest"))
+    let line = sessionAlertLine(ts: 5, pid: 7, mb: 2048, limitMB: 1024, cwd: "/a \"b\"/c", title: "t",
+                                top: TopChild(pid: 9, bytes: 3 * 1_048_576, cmd: "vitest"))
     let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
-    precondition(!line.contains("\n") && obj?["pid"] as? Int == 7 && obj?["limit_mb"] as? Int == 1024)
+    precondition(!line.contains("\n") && obj?["kind"] as? String == "session" && obj?["pid"] as? Int == 7
+                 && obj?["limit_mb"] as? Int == 1024 && obj?["title"] as? String == "t")
     precondition(obj?["cwd"] as? String == "/a \"b\"/c")
     let tj = obj?["top"] as? [String: Any]
     precondition(tj?["pid"] as? Int == 9 && tj?["mb"] as? Int == 3 && tj?["cmd"] as? String == "vitest")
-    precondition((try? JSONSerialization.jsonObject(with: Data(pendingLine(ts: 1, pid: 1, mb: 1, limitMB: 1, cwd: "", top: nil).utf8)) as? [String: Any])?["top"] == nil)
+    let l2 = (try? JSONSerialization.jsonObject(with: Data(sessionAlertLine(ts: 1, pid: 1, mb: 1, limitMB: 1, cwd: "", title: nil, top: nil).utf8))) as? [String: Any]
+    precondition(l2?["top"] is NSNull && l2?["title"] is NSNull)
+    let ol = orphanAlertLine(ts: 3, pid: 4, name: "node", mb: 600, limitMB: 500, cwd: "/x")
+    let oo = (try? JSONSerialization.jsonObject(with: Data(ol.utf8))) as? [String: Any]
+    precondition(oo?["kind"] as? String == "orphan" && oo?["name"] as? String == "node" && oo?["mb"] as? Int == 600
+                 && oo?["limit_mb"] as? Int == 500 && oo?["cwd"] as? String == "/x" && oo?["ts"] as? Int == 3)
+    precondition(systemLowText(freePercent: 14, consumers: [("a", 1_048_576), ("Brave", 4 * 1_073_741_824), ("c", 2_097_152)])
+                 == "Memoria libre baja: 14 % · mayores: Brave 4,0 GB, c 2 MB")
+    precondition(systemLowText(freePercent: 9, consumers: []) == "Memoria libre baja: 9 %")
+    let tmp = NSTemporaryDirectory() + "guachiman-st-\(getpid())/alerts.jsonl"
+    appendAlert("uno", path: tmp, maxBytes: 8)
+    appendAlert("dos", path: tmp, maxBytes: 8)
+    precondition((try? String(contentsOfFile: tmp)) == "uno\ndos\n")
+    appendAlert("tres", path: tmp, maxBytes: 8)   // pesa 8, no > 8: sin rotar
+    appendAlert("cuatro", path: tmp, maxBytes: 8) // pesa 13 > 8: rota
+    precondition((try? String(contentsOfFile: tmp + ".1")) == "uno\ndos\ntres\n" && (try? String(contentsOfFile: tmp)) == "cuatro\n")
+    try? FileManager.default.removeItem(atPath: (tmp as NSString).deletingLastPathComponent)
 
     precondition(Orphan.name(exe: "/usr/local/bin/node", argv0: nil) == "node")
     precondition(Orphan.name(exe: "/x/y", argv0: "next-server (v14)") == "next-server")
@@ -323,6 +393,10 @@ func runSelfTest() {
     precondition(rowColor(bytes: 10, cpu: 60, ramLimit: 1000, cpuLimit: 80, idleFor: 0) == .yellow)
     precondition(rowColor(bytes: 10, cpu: 500, ramLimit: 1000, cpuLimit: nil, idleFor: 0) == .green)    // huérfano: sin umbral de CPU
 
+    precondition(freeMemoryColor(freePercent: 19) == .red && freeMemoryColor(freePercent: 20) == .yellow)
+    precondition(freeMemoryColor(freePercent: 40) == .yellow && freeMemoryColor(freePercent: 41) == .green)
+    precondition(cpuLoadPercent(prev: (10, 100), cur: (35, 200)) == 25)
+    precondition(cpuLoadPercent(prev: (10, 100), cur: (10, 100)) == 0)
     let now = Date()
     precondition(!pauseActive(until: nil, now: now))
     precondition(pauseActive(until: now + 10, now: now))
@@ -686,41 +760,86 @@ func liveTree(_ root: pid_t) -> [pid_t] {
     return out
 }
 
-/// Fila del menú: círculo de estado, nombre y botón de detener (opcional) al borde derecho.
-final class RowView: NSView {
-    init(text: String, color: NSColor, stopTag: Int?, target: AnyObject, action: Selector) {
-        let label = NSTextField(labelWithString: text)
-        label.font = NSFont.menuFont(ofSize: 0)
-        label.sizeToFit()
-        let height: CGFloat = 22
-        let width = 28 + label.frame.width + 12 + 16 + 12
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
-        autoresizingMask = [.width]
+// MARK: - Panel isla (vistas AppKit; solo existen mientras el panel está abierto)
 
-        let dot = NSView(frame: NSRect(x: 14, y: (height - 8) / 2, width: 8, height: 8))
+class FlippedView: NSView { override var isFlipped: Bool { true } }
+
+/// Panel sin activar la app: puede ser key para recibir Esc, nunca main.
+final class IslandPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Anillo con el porcentaje de memoria libre al centro.
+final class RingGauge: NSView {
+    var percent = 0
+    var color = NSColor.systemGreen
+
+    override func draw(_ dirtyRect: NSRect) {
+        let c = NSPoint(x: bounds.midX, y: bounds.midY)
+        let radius = min(bounds.width, bounds.height) / 2 - 5
+        let track = NSBezierPath()
+        track.appendArc(withCenter: c, radius: radius, startAngle: 0, endAngle: 360)
+        track.lineWidth = 7
+        NSColor(white: 1, alpha: 0.14).setStroke()
+        track.stroke()
+        if percent > 0 {
+            let arc = NSBezierPath()
+            arc.appendArc(withCenter: c, radius: radius, startAngle: 90,
+                          endAngle: 90 - 360 * CGFloat(min(percent, 100)) / 100, clockwise: true)
+            arc.lineWidth = 7
+            arc.lineCapStyle = .round
+            color.setStroke()
+            arc.stroke()
+        }
+        let s = NSAttributedString(string: "\(percent)%", attributes: [
+            .font: NSFont.systemFont(ofSize: 20, weight: .semibold), .foregroundColor: NSColor.white])
+        let size = s.size()
+        s.draw(at: NSPoint(x: c.x - size.width / 2, y: c.y - size.height / 2))
+    }
+}
+
+func panelLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, alpha: CGFloat = 1,
+                align: NSTextAlignment = .left, frame: NSRect) -> NSTextField {
+    let l = NSTextField(labelWithString: text)
+    l.font = NSFont.systemFont(ofSize: size, weight: weight)
+    l.textColor = NSColor(white: 1, alpha: alpha)
+    l.alignment = align
+    l.lineBreakMode = .byTruncatingTail
+    l.maximumNumberOfLines = 1
+    l.frame = frame
+    return l
+}
+
+/// Fila del panel: círculo de estado, nombre, "1,2 GB · 3 %" y botón de detener al borde derecho.
+final class PanelRow: FlippedView {
+    static let height: CGFloat = 24
+
+    init(width: CGFloat, text: String, detail: String, color: NSColor, stopTag: Int?, stopLabel: String,
+         target: AnyObject, action: Selector) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: PanelRow.height))
+        let dot = NSView(frame: NSRect(x: 0, y: 8, width: 8, height: 8))
         dot.wantsLayer = true
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.cornerRadius = 4
         addSubview(dot)
-
-        label.frame.origin = NSPoint(x: 28, y: (height - label.frame.height) / 2)
-        label.autoresizingMask = [.width]
-        label.lineBreakMode = .byTruncatingTail
-        addSubview(label)
-
+        let detailW: CGFloat = 86
+        let detailX = width - 22 - detailW
+        addSubview(panelLabel(text, size: 12, frame: NSRect(x: 16, y: 4, width: detailX - 22, height: 16)))
+        addSubview(panelLabel(detail, size: 11, alpha: 0.6, align: .right,
+                              frame: NSRect(x: detailX, y: 5, width: detailW, height: 14)))
         if let stopTag {
-            let button = NSButton(frame: NSRect(x: width - 28, y: (height - 16) / 2, width: 16, height: 16))
-            let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
-            button.image = NSImage(systemSymbolName: "stop.circle", accessibilityDescription: "Cerrar")?
-                .withSymbolConfiguration(cfg)
+            let button = NSButton(frame: NSRect(x: width - 16, y: 4, width: 16, height: 16))
+            button.image = NSImage(systemSymbolName: "stop.circle", accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
             button.imagePosition = .imageOnly
             button.isBordered = false
             button.contentTintColor = .secondaryLabelColor
             button.toolTip = "Cerrar"
+            button.setAccessibilityLabel(stopLabel)
             button.tag = stopTag
             button.target = target
             button.action = action
-            button.autoresizingMask = [.minXMargin]
             addSubview(button)
         }
     }
@@ -728,7 +847,7 @@ final class RowView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let notifier = Notifier()
     private let memory = physicalMemory()
@@ -742,7 +861,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var idleTracker = SustainedTracker<String>()   // desde cuándo cada fila está con CPU < 1 %
     private var lastIdle: [String: TimeInterval] = [:]
     private var rowTargets: [KillTarget] = []
-    private let menu = NSMenu()
+    private var panel: IslandPanel?
+    private var globalMonitor: Any?
+    private var localMonitor: Any?
+    private var menuOpen = false
+    private var cpuTotal: Double?
+    private var cpuTicksPrev: (busy: UInt64, total: UInt64)?
+    private var debugPanelShown = false
     private let agentURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents/\(Config.agentLabel).plist")
     private var autoClose: Bool {
@@ -753,11 +878,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        menu.autoenablesItems = false
-        menu.delegate = self
-        statusItem.menu = menu
-        // Pendientes de una ejecución anterior ya no valen (y harían lento al hook): se vuelve a avisar si sigue el problema.
-        try? FileManager.default.removeItem(atPath: Config.pendingDir)
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(togglePanel)
+            button.sendAction(on: [.leftMouseUp])
+        }
+        // Limpieza única del directorio `pending/` de versiones anteriores (inofensiva si no existe).
+        try? FileManager.default.removeItem(atPath: Config.supportDir + "/pending")
+        cpuTicksPrev = cpuTicks()   // base para que el primer sondeo ya muestre CPU total
         let wantsTest = CommandLine.arguments.contains("--notify-test")
         notifier.start { [weak self] in
             guard let self else { return }
@@ -787,6 +915,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func runPoll() {
         let snap = takeSnapshot()
         let now = Date()
+        if let cur = cpuTicks() {
+            if let prev = cpuTicksPrev { cpuTotal = cpuLoadPercent(prev: prev, cur: cur) }
+            cpuTicksPrev = cur
+        }
         let limit = UInt64(Double(memory) * Config.sessionFraction)
 
         // Inactividad: desde cuándo cada fila lleva con CPU < 1 % (y se olvidan las que desaparecen).
@@ -813,9 +945,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     var text = "Sesión \(sessionLabel(s)) usa \(formatBytes(s.bytes)) (pid \(s.pid))"
                     if let t = s.top { text += " (mayor: \(t.cmd) \(formatBytes(t.bytes)))" }
                     if alert(key: "session:\(s.pid)", value: Double(s.bytes), text: text, now: now) {
-                        appendPending(rootPid: s.pid, line: pendingLine(
+                        appendAlert(sessionAlertLine(
                             ts: Int(now.timeIntervalSince1970), pid: s.pid, mb: s.bytes / 1_048_576,
-                            limitMB: limit / 1_048_576, cwd: s.cwd, top: s.top))
+                            limitMB: limit / 1_048_576, cwd: s.cwd, title: cachedSessionTitle(pid: s.pid), top: s.top))
                     }
                 }
             } else {
@@ -833,8 +965,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard o.bytes > Config.orphanBytes else { continue }
             if dur >= Config.orphanAlertAfter {
                 orphanOver = true
-                alert(key: "orphan:\(o.pid)", value: Double(o.bytes),
-                      text: "Huérfano \(o.name) usa \(formatBytes(o.bytes)) (pid \(o.pid))", now: now)
+                if alert(key: "orphan:\(o.pid)", value: Double(o.bytes),
+                         text: "Huérfano \(o.name) usa \(formatBytes(o.bytes)) (pid \(o.pid))", now: now) {
+                    appendAlert(orphanAlertLine(
+                        ts: Int(now.timeIntervalSince1970), pid: o.pid, name: o.name, mb: o.bytes / 1_048_576,
+                        limitMB: Config.orphanBytes / 1_048_576, cwd: currentDirectory(o.pid) ?? ""))
+                }
             }
             if dur >= Config.orphanCloseAfter, autoClose, !pauseActive(until: pausedUntil, now: now),
                !closedAttempted.contains(o.pid) {
@@ -860,9 +996,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                       text: "\(a.name) usa \(Int(a.cpu.rounded())) % de CPU sostenido", now: now)
             }
         }
-        for k in lastAlert.keys where k.hasPrefix("session:") {   // sesión que murió: borra su pendiente
-            if let pid = pid_t(k.dropFirst(8)), !livePids.contains(pid) { removePending(rootPid: pid) }
-        }
         pruneTitleCache(live: livePids)
         lastAlert = lastAlert.filter { k, _ in
             if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
@@ -874,8 +1007,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Memoria del sistema (el "valor" es la presión usada: crece cuando baja la libre).
         let systemLow = snap.freePercent < Config.systemFreeMinPercent
         if systemLow {
+            let consumers = snap.sessions.prefix(2).map { (name: sessionLabel($0), bytes: $0.bytes) }
+                + snap.apps.prefix(2).map { (name: $0.name, bytes: $0.bytes) }
             alert(key: "system", value: Double(100 - snap.freePercent),
-                  text: "Memoria libre baja: \(snap.freePercent)%", now: now)
+                  text: systemLowText(freePercent: snap.freePercent, consumers: consumers), now: now)
         }
 
         updateUI(snap, alerting: anyOver || systemLow || orphanOver || appOver)
@@ -931,6 +1066,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateUI(_ snap: Snapshot, alerting: Bool) {
         lastSnap = snap
+        if let p = panel { fillPanel(p) }   // el panel abierto se refresca con cada sondeo
+        if CommandLine.arguments.contains("--show-panel"), !debugPanelShown {   // solo para verificar
+            debugPanelShown = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.openPanel()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 30) { self?.closePanel() }
+            }
+        }
         if let button = statusItem.button {
             // Ícono propio de 18 pt de alto; si no está en el bundle, usa el SF Symbol.
             let base: NSImage?
@@ -963,49 +1106,182 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // MARK: Menú (se construye al abrirlo, a partir del último snapshot)
+    // MARK: Panel isla (se crea al abrir, se libera por completo al cerrar)
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
+    private func nsColor(_ c: RowColor) -> NSColor {
+        switch c {
+        case .green: return .systemGreen
+        case .yellow: return .systemYellow
+        case .red: return .systemRed
+        case .gray: return .systemGray
+        }
+    }
+
+    @objc private func togglePanel() { panel == nil ? openPanel() : closePanel() }
+
+    private func openPanel() {
+        guard panel == nil, statusItem.button?.window != nil else { return }
+        let p = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 730, height: 170),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
+        p.level = .popUpMenu
+        p.appearance = NSAppearance(named: .darkAqua)
+        p.isReleasedWhenClosed = false
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel = p
+        fillPanel(p)
+        p.alphaValue = 0
+        p.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.12; p.animator().alphaValue = 1 }
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            self?.closePanel()
+        }
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]) { [weak self] e in
+            guard let self, let p = self.panel, !self.menuOpen else { return e }
+            if e.type == .keyDown {
+                if e.keyCode == 53 { self.closePanel(); return nil }   // Esc
+            } else if e.window !== p, e.window !== self.statusItem.button?.window {
+                self.closePanel()
+            }
+            return e
+        }
+    }
+
+    private func closePanel() {
+        guard let p = panel else { return }
+        panel = nil
         rowTargets = []
+        if let m = globalMonitor { NSEvent.removeMonitor(m) }
+        if let m = localMonitor { NSEvent.removeMonitor(m) }
+        globalMonitor = nil
+        localMonitor = nil
+        NSAnimationContext.runAnimationGroup({ $0.duration = 0.12; p.animator().alphaValue = 0 }, completionHandler: {
+            p.orderOut(nil)
+            p.contentView = nil
+        })
+    }
+
+    /// Reconstruye el contenido a partir del último snapshot y recoloca el panel bajo el ícono.
+    private func fillPanel(_ p: IslandPanel) {
+        let snap = lastSnap ?? Snapshot(sessions: [], orphans: [], apps: [], freePercent: 100)
+        let leftW: CGFloat = 130, colW: CGFloat = 300, W = leftW + 2 * colW, rowH = PanelRow.height, rowsTop: CGFloat = 40
         let limit = UInt64(Double(memory) * Config.sessionFraction)
-        if let snap = lastSnap {
-            menu.addItem(disabled("Memoria libre: \(snap.freePercent)%"))
-            if snap.sessions.isEmpty {
-                menu.addItem(disabled("Sin sesiones de Claude"))
+        let sessions = Array(snap.sessions.prefix(8))
+        let orphans = Array(snap.orphans.prefix(4))
+        let apps = Array(snap.apps.prefix(5))
+        let rightRows = apps.count + (orphans.isEmpty ? 0 : orphans.count + 1)
+        let H = max(170, rowsTop + CGFloat(max(max(sessions.count, 1), rightRows)) * rowH + 18)
+
+        let root = FlippedView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor.black.cgColor
+        root.layer?.cornerRadius = 20
+        root.layer?.masksToBounds = true
+
+        // Izquierda: anillo de memoria libre y CPU total.
+        let gauge = RingGauge(frame: NSRect(x: (leftW - 84) / 2, y: 18, width: 84, height: 84))
+        gauge.percent = snap.freePercent
+        gauge.color = nsColor(freeMemoryColor(freePercent: snap.freePercent))
+        gauge.setAccessibilityElement(true)
+        gauge.setAccessibilityRole(.image)
+        gauge.setAccessibilityLabel("Memoria libre \(snap.freePercent) %")
+        root.addSubview(gauge)
+        let cpuText = cpuTotal.map { "\(Int($0.rounded())) %" } ?? "—"
+        root.addSubview(panelLabel(cpuText, size: 15, weight: .semibold, align: .center,
+                                   frame: NSRect(x: 0, y: 112, width: leftW, height: 20)))
+        root.addSubview(panelLabel("CPU total", size: 10.5, alpha: 0.55, align: .center,
+                                   frame: NSRect(x: 0, y: 132, width: leftW, height: 14)))
+
+        for x in [leftW, leftW + colW] {
+            let d = NSView(frame: NSRect(x: x, y: 16, width: 1, height: H - 32))
+            d.wantsLayer = true
+            d.layer?.backgroundColor = NSColor(white: 1, alpha: 0.12).cgColor
+            root.addSubview(d)
+        }
+
+        rowTargets = []
+        func addRow(_ x: CGFloat, _ y: CGFloat, _ text: String, _ detail: String, _ color: RowColor, _ t: KillTarget) {
+            var tag: Int?
+            if !t.pids.isEmpty, !t.pids.contains(getpid()) {   // nunca ofrece cerrar a Guachiman
+                rowTargets.append(t)
+                tag = rowTargets.count - 1
             }
-            for s in snap.sessions {
-                let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
-                                 idleFor: lastIdle["session:\(s.pid)"] ?? 0)
-                let title = sessionTitle(pid: s.pid).map(truncatedTitle)
-                menu.addItem(row("\(title ?? s.label) — \(formatBytes(s.bytes)) (pid \(s.pid))", c,
-                                 KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false)))
-            }
-            for o in snap.orphans {
+            let r = PanelRow(width: colW - 32, text: text, detail: detail, color: nsColor(color), stopTag: tag,
+                             stopLabel: "Cerrar \(t.name)", target: self, action: #selector(stopClicked(_:)))
+            r.frame.origin = NSPoint(x: x + 16, y: y)
+            root.addSubview(r)
+        }
+        func header(_ text: String, _ x: CGFloat, _ y: CGFloat, width: CGFloat) {
+            root.addSubview(panelLabel(text, size: 10.5, weight: .semibold, alpha: 0.5,
+                                       frame: NSRect(x: x + 16, y: y, width: width, height: 14)))
+        }
+        func detail(_ bytes: UInt64, _ cpu: Double) -> String { "\(formatBytes(bytes)) · \(Int(cpu.rounded())) %" }
+
+        // Centro: sesiones de Claude.
+        header("Sesiones de Claude", leftW, 14, width: colW - 32)
+        if sessions.isEmpty {
+            root.addSubview(panelLabel("Sin sesiones de Claude", size: 12, alpha: 0.5,
+                                       frame: NSRect(x: leftW + 16, y: rowsTop + 4, width: colW - 32, height: 16)))
+        }
+        for (i, s) in sessions.enumerated() {
+            let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
+                             idleFor: lastIdle["session:\(s.pid)"] ?? 0)
+            let title = sessionTitle(pid: s.pid).map(truncatedTitle)
+            addRow(leftW, rowsTop + CGFloat(i) * rowH, title ?? s.label, detail(s.bytes, s.cpu), c,
+                   KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false))
+        }
+
+        // Derecha: apps que más consumen y huérfanos.
+        let rx = leftW + colW
+        header("Apps que más consumen", rx, 14, width: colW - 64)
+        for (i, a) in apps.enumerated() {
+            let c = rowColor(bytes: a.bytes, cpu: a.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
+                             idleFor: lastIdle[a.key] ?? 0)
+            let single = a.key.hasPrefix("pid:")
+            addRow(rx, rowsTop + CGFloat(i) * rowH, a.name, detail(a.bytes, a.cpu), c,
+                   KillTarget(name: a.name, bytes: a.bytes, pids: a.pids, appPath: single ? nil : a.key, expandTree: single))
+        }
+        if !orphans.isEmpty {
+            let hy = rowsTop + CGFloat(apps.count) * rowH + 6
+            header("Huérfanos", rx, hy, width: colW - 32)
+            for (i, o) in orphans.enumerated() {
                 let c = rowColor(bytes: o.bytes, cpu: o.cpu, ramLimit: Config.orphanBytes, cpuLimit: nil,
                                  idleFor: lastIdle["orphan:\(o.pid)"] ?? 0)
-                menu.addItem(row("Huérfano \(o.name) — \(formatBytes(o.bytes)) (pid \(o.pid))", c,
-                                 KillTarget(name: o.name, bytes: o.bytes, pids: o.tree, appPath: nil, expandTree: false)))
-            }
-            menu.addItem(.separator())
-            menu.addItem(disabled("Apps que más consumen"))
-            for a in snap.apps.prefix(5) {
-                let c = rowColor(bytes: a.bytes, cpu: a.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
-                                 idleFor: lastIdle[a.key] ?? 0)
-                let single = a.key.hasPrefix("pid:")
-                menu.addItem(row("\(a.name) — \(formatBytes(a.bytes)) · \(Int(a.cpu.rounded())) % CPU", c,
-                                 KillTarget(name: a.name, bytes: a.bytes, pids: a.pids, appPath: single ? nil : a.key, expandTree: single)))
+                addRow(rx, hy + 16 + CGFloat(i) * rowH, o.name, detail(o.bytes, o.cpu), c,
+                       KillTarget(name: o.name, bytes: o.bytes, pids: o.tree, appPath: nil, expandTree: false))
             }
         }
-        if !notifier.isAuthorized {
-            let item = NSMenuItem(title: "Activar notificaciones…", action: #selector(openNotificationSettings), keyEquivalent: "")
-            item.target = self
-            item.isEnabled = true
-            menu.addItem(item)
+
+        // Engranaje arriba a la derecha.
+        let gear = NSButton(frame: NSRect(x: W - 36, y: 10, width: 22, height: 22))
+        gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+        gear.imagePosition = .imageOnly
+        gear.isBordered = false
+        gear.contentTintColor = .secondaryLabelColor
+        gear.toolTip = "Ajustes"
+        gear.setAccessibilityLabel("Ajustes")
+        gear.target = self
+        gear.action = #selector(showSettings(_:))
+        root.addSubview(gear)
+
+        p.contentView = root
+        // Centrado bajo el ícono y recortado a la zona visible de la pantalla.
+        if let button = statusItem.button, let win = button.window {
+            let r = win.convertToScreen(button.convert(button.bounds, to: nil))
+            let vf = (win.screen ?? NSScreen.main)?.visibleFrame ?? r
+            let x = max(vf.minX + 8, min(r.midX - W / 2, vf.maxX - W - 8))
+            p.setFrame(NSRect(x: x, y: max(vf.minY, r.minY - 6 - H), width: W, height: H), display: true)
+            p.invalidateShadow()
         }
-        menu.addItem(.separator())
-        let now = Date()
-        if pauseActive(until: pausedUntil, now: now), let until = pausedUntil {
+    }
+
+    @objc private func showSettings(_ sender: NSButton) {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        if pauseActive(until: pausedUntil, now: Date()), let until = pausedUntil {
             let f = DateFormatter()
             f.dateFormat = "HH:mm"
             menu.addItem(toggle("Reanudar (pausado hasta \(f.string(from: until)))", #selector(togglePause), on: false))
@@ -1015,40 +1291,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(toggle("Cerrar huérfanos automáticamente", #selector(toggleAutoClose), on: autoClose))
         menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
                             on: FileManager.default.fileExists(atPath: agentURL.path)))
+        if !notifier.isAuthorized {
+            let item = NSMenuItem(title: "Activar notificaciones…", action: #selector(openNotificationSettings), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Salir", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
-    }
-
-    /// Suelta las vistas de las filas al cerrar el menú (los ítems normales se quedan).
-    func menuDidClose(_ menu: NSMenu) {
-        for item in menu.items where item.view != nil { item.view = nil }
-        rowTargets = []
-    }
-
-    private func row(_ text: String, _ color: RowColor, _ target: KillTarget) -> NSMenuItem {
-        let ns: NSColor
-        switch color {
-        case .green: ns = .systemGreen
-        case .yellow: ns = .systemYellow
-        case .red: ns = .systemRed
-        case .gray: ns = .systemGray
-        }
-        var tag: Int?
-        if !target.pids.isEmpty, !target.pids.contains(getpid()) {   // nunca ofrece cerrar a Guachiman
-            rowTargets.append(target)
-            tag = rowTargets.count - 1
-        }
-        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-        item.view = RowView(text: text, color: ns, stopTag: tag, target: self, action: #selector(stopClicked(_:)))
-        return item
+        menuOpen = true
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+        menuOpen = false
     }
 
     @objc private func stopClicked(_ sender: NSButton) {
         guard rowTargets.indices.contains(sender.tag) else { return }
         let t = rowTargets[sender.tag]
-        statusItem.menu?.cancelTracking()
+        closePanel()
         DispatchQueue.main.async { [weak self] in self?.confirmClose(t) }
     }
 
@@ -1098,12 +1358,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 for pid in left where alive(pid) { kill(pid, SIGKILL) }
             }
         }
-    }
-
-    private func disabled(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        return item
     }
 }
 
