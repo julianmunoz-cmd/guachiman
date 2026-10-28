@@ -1,7 +1,7 @@
 APP := build/Guachiman.app
 BIN := $(APP)/Contents/MacOS/Guachiman
 
-.PHONY: all run check notify-test clean
+.PHONY: all run check test notify-test clean
 
 all: $(BIN)
 
@@ -16,6 +16,9 @@ run: all
 
 check: all
 	$(BIN) --once
+
+test: all
+	$(BIN) --selftest
 
 notify-test: all
 	open $(APP) --args --notify-test

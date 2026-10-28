@@ -16,9 +16,20 @@ Son solo nativas (`UNUserNotificationCenter`); la app nunca usa `osascript`, as�
 
 Para comprobar que funcionan, ejecuta `make notify-test`: abre la app con `--notify-test` y, al resolverse la autorización, envía "Prueba: Guachiman puede notificarte".
 
+## Huérfanos
+
+Un candidato a huérfano es un proceso con `ppid == 1` cuyo nombre (del ejecutable o de `argv[0]`, también con sufijo tras guion, como `next-server`) es `node`, `vitest`, `next` o `playwright`, y que no pertenece a ninguna sesión de Claude. Su RAM suma la del proceso y la de todos sus descendientes. Se avisa cuando supera 500 MB de forma sostenida por 60 s, con el mismo enfriamiento que el resto de alertas. `--once` también los lista.
+
+## Menú
+
+- **Cerrar huérfanos automáticamente** (apagado por defecto, se recuerda entre ejecuciones): si lo activas, un huérfano de más de 500 MB sostenido por 10 min recibe SIGTERM junto con sus descendientes, tras reverificar que sigue siendo huérfano. No se escala a SIGKILL y se te notifica qué se cerró.
+- **Pausar 1 h**: durante una hora no hay notificaciones ni cierres automáticos; el menú y el ícono siguen actualizándose. Mientras dura aparece "Reanudar (pausado hasta HH:mm)", que cancela la pausa.
+- **Iniciar al encender**: crea o borra `~/Library/LaunchAgents/io.github.guachiman.plist` (surte efecto en el próximo inicio de sesión). "Salir" termina con estado 0, así que no se relanza.
+- Solo se ejecuta una instancia a la vez.
+
 ## Qué no hace
 
-Nunca mata procesos ni les envía señales. Es de solo lectura.
+Por defecto es de solo lectura: no envía señales a ningún proceso. Solo cierra huérfanos si tú activas "Cerrar huérfanos automáticamente", y nunca toca sesiones de Claude.
 
 ## Compilar y correr
 
@@ -26,6 +37,7 @@ Nunca mata procesos ni les envía señales. Es de solo lectura.
 make          # compila build/Guachiman.app y la firma ad-hoc
 make run      # compila y abre la app
 make check    # ejecuta --once
+make test     # ejecuta --selftest
 make notify-test  # compila, abre la app y envía una notificación de prueba
 make clean
 ```

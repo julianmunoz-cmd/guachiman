@@ -1,5 +1,7 @@
 // Guachiman — menu bar app que vigila la RAM de las sesiones de Claude Code.
-// Solo lectura: nunca mata ni envía señales a procesos.
+// Por defecto es de solo lectura. Solo envía SIGTERM a procesos huérfanos
+// (ppid 1: node, vitest, next, playwright) si el usuario activa "Cerrar huérfanos
+// automáticamente" en el menú (apagado de fábrica); nunca toca sesiones de Claude.
 
 import AppKit
 import Darwin
@@ -16,6 +18,93 @@ enum Config {
     static let pollActive: TimeInterval = 20     // con >= 1 sesión
     static let pollIdle: TimeInterval = 60       // sin sesiones
     static let sessionExecutable = "claude"
+    static let orphanBytes: UInt64 = 500 * 1_048_576  // huérfano: > 500 MB
+    static let orphanAlertAfter: TimeInterval = 60    // ... sostenido 60 s para avisar
+    static let orphanCloseAfter: TimeInterval = 600   // ... sostenido 10 min para cerrar
+    static let pauseDuration: TimeInterval = 3600
+    static let autoCloseKey = "autoCloseOrphans"
+    static let agentLabel = "io.github.guachiman"
+}
+
+// MARK: - Lógica pura (cubierta por --selftest)
+
+enum Orphan {
+    static let names: Set<String> = ["node", "vitest", "next", "playwright"]
+
+    /// Nombre coincidente: último componente del ejecutable o del primer token de argv[0];
+    /// acepta sufijo con guion (`next-server`) porque las herramientas renombran el título.
+    static func name(exe: String?, argv0: String?) -> String? {
+        for c in [exe, argv0?.split(separator: " ").first.map(String.init)] {
+            guard let c else { continue }
+            let n = (c as NSString).lastPathComponent.lowercased()
+            if names.contains(n) || names.contains(where: { n.hasPrefix($0 + "-") }) { return n }
+        }
+        return nil
+    }
+}
+
+/// Desde cuándo está cada pid por encima del umbral.
+struct SustainedTracker {
+    private var since: [pid_t: Date] = [:]
+
+    /// Devuelve cuánto lleva sostenido (0 si no está por encima).
+    mutating func update(_ pid: pid_t, over: Bool, now: Date) -> TimeInterval {
+        guard over else { since[pid] = nil; return 0 }
+        let start = since[pid] ?? now
+        since[pid] = start
+        return now.timeIntervalSince(start)
+    }
+
+    mutating func retain(_ live: Set<pid_t>) { since = since.filter { live.contains($0.key) } }
+}
+
+func pauseActive(until: Date?, now: Date) -> Bool {
+    guard let until else { return false }
+    return now < until
+}
+
+func launchAgentPlist(executable: String) -> [String: Any] {
+    ["Label": Config.agentLabel,
+     "ProgramArguments": [executable],
+     "RunAtLoad": true,
+     "KeepAlive": ["SuccessfulExit": false],
+     "ProcessType": "Interactive"]
+}
+
+func runSelfTest() {
+    precondition(Orphan.name(exe: "/usr/local/bin/node", argv0: nil) == "node")
+    precondition(Orphan.name(exe: "/x/y", argv0: "next-server (v14)") == "next-server")
+    precondition(Orphan.name(exe: nil, argv0: "playwright-core run") == "playwright-core")
+    precondition(Orphan.name(exe: "/opt/VITEST", argv0: nil) == "vitest")
+    precondition(Orphan.name(exe: "/bin/zsh", argv0: "nodemon") == nil)
+    precondition(Orphan.name(exe: "/bin/zsh", argv0: "claude") == nil)
+    precondition(Orphan.name(exe: nil, argv0: nil) == nil)
+
+    var t = SustainedTracker()
+    let t0 = Date()
+    precondition(t.update(1, over: true, now: t0) == 0)
+    precondition(t.update(1, over: true, now: t0 + 61) >= Config.orphanAlertAfter)
+    precondition(t.update(1, over: true, now: t0 + 61) < Config.orphanCloseAfter)
+    precondition(t.update(1, over: true, now: t0 + 601) >= Config.orphanCloseAfter)
+    precondition(t.update(1, over: false, now: t0 + 602) == 0)
+    precondition(t.update(1, over: true, now: t0 + 700) == 0)   // reinicia al volver a superar
+    _ = t.update(2, over: true, now: t0)
+    t.retain([1])
+    precondition(t.update(2, over: true, now: t0 + 900) == 0)   // pid muerto olvidado
+
+    let now = Date()
+    precondition(!pauseActive(until: nil, now: now))
+    precondition(pauseActive(until: now + 10, now: now))
+    precondition(!pauseActive(until: now - 1, now: now))
+
+    let d = launchAgentPlist(executable: "/a/Guachiman")
+    precondition(d["Label"] as? String == "io.github.guachiman")
+    precondition(d["ProgramArguments"] as? [String] == ["/a/Guachiman"])
+    precondition(d["RunAtLoad"] as? Bool == true)
+    precondition((d["KeepAlive"] as? [String: Bool])?["SuccessfulExit"] == false)
+    precondition(d["ProcessType"] as? String == "Interactive")
+    precondition((try? PropertyListSerialization.data(fromPropertyList: d, format: .xml, options: 0)) != nil)
+    print("selftest OK")
 }
 
 // MARK: - Lectura de procesos (libproc / sysctl)
@@ -27,8 +116,16 @@ struct Session {
     let bytes: UInt64
 }
 
+struct OrphanProc {
+    let pid: pid_t
+    let name: String
+    let bytes: UInt64
+    let tree: [pid_t]   // el huérfano y todos sus descendientes
+}
+
 struct Snapshot {
     let sessions: [Session]   // ordenadas por RAM desc
+    let orphans: [OrphanProc]
     let freePercent: Int
 }
 
@@ -134,22 +231,41 @@ func takeSnapshot() -> Snapshot {
         return true
     }
 
-    var sessions: [Session] = []
-    for root in roots {
-        var total: UInt64 = 0
+    func tree(_ root: pid_t) -> [pid_t] {
+        var out: [pid_t] = []
         var stack = [root]
         var seen = Set<pid_t>()
         while let pid = stack.popLast() {
             guard seen.insert(pid).inserted else { continue }
-            total += residentSize(pid) ?? 0
+            out.append(pid)
             stack.append(contentsOf: children[pid] ?? [])
         }
+        return out
+    }
+
+    var sessions: [Session] = []
+    var sessionPids = Set<pid_t>()
+    for root in roots {
+        let pids = tree(root)
+        sessionPids.formUnion(pids)
+        let total = pids.reduce(UInt64(0)) { $0 + (residentSize($1) ?? 0) }
         let cwd = currentDirectory(root) ?? ""
         let label = cwd.isEmpty ? "?" : (cwd as NSString).lastPathComponent
         sessions.append(Session(pid: root, label: label, cwd: cwd, bytes: total))
     }
     sessions.sort { $0.bytes > $1.bytes }
-    return Snapshot(sessions: sessions, freePercent: freeMemoryPercent())
+
+    // Huérfanos: ppid 1, nombre conocido, fuera de (y sin claude dentro de) árboles de sesión.
+    var orphans: [OrphanProc] = []
+    for (pid, ppid) in parents where ppid == 1 && !claudePids.contains(pid) && !sessionPids.contains(pid) {
+        guard let name = Orphan.name(exe: executablePath(pid), argv0: argv0(pid)) else { continue }
+        let pids = tree(pid)
+        if !sessionPids.isDisjoint(with: pids) { continue }
+        orphans.append(OrphanProc(pid: pid, name: name,
+                                  bytes: pids.reduce(UInt64(0)) { $0 + (residentSize($1) ?? 0) }, tree: pids))
+    }
+    orphans.sort { $0.bytes > $1.bytes }
+    return Snapshot(sessions: sessions, orphans: orphans, freePercent: freeMemoryPercent())
 }
 
 // MARK: - Formato
@@ -172,6 +288,10 @@ func runOnce() {
         print("\(s.pid)\t\(s.label)\t\(s.bytes / 1_048_576)\t\(s.cwd)")
     }
     if snap.sessions.isEmpty { print("(sin sesiones de Claude)") }
+    print("")
+    print("Candidatos a huérfano (pid\tnombre\tMB)")
+    for o in snap.orphans { print("\(o.pid)\t\(o.name)\t\(o.bytes / 1_048_576)") }
+    if snap.orphans.isEmpty { print("(ninguno)") }
     print("")
     print("Memoria libre: \(snap.freePercent)%")
     print("RAM física: \(mem / 1_048_576) MB")
@@ -228,6 +348,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let notifier = Notifier()
     private let memory = physicalMemory()
     private var overSince: [pid_t: Date] = [:]
+    private var orphanTracker = SustainedTracker()
+    private var closedAttempted = Set<pid_t>()
+    private var pausedUntil: Date?
+    private var lastSnap: Snapshot?
+    private var lastAlerting = false
+    private let agentURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents/\(Config.agentLabel).plist")
+    private var autoClose: Bool {
+        get { UserDefaults.standard.bool(forKey: Config.autoCloseKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Config.autoCloseKey) }
+    }
     private var lastAlert: [String: (date: Date, value: Double)] = [:]
     private var timer: Timer?
 
@@ -280,7 +411,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 overSince[s.pid] = nil
             }
         }
-        lastAlert = lastAlert.filter { !$0.key.hasPrefix("session:") || livePids.contains(pid_t($0.key.dropFirst(8)) ?? -1) }
+
+        // Huérfanos: aviso a los 60 s, cierre opcional a los 10 min.
+        var orphanOver = false
+        let orphanPids = Set(snap.orphans.map { $0.pid })
+        orphanTracker.retain(orphanPids)
+        closedAttempted.formIntersection(orphanPids)
+        for o in snap.orphans {
+            let dur = orphanTracker.update(o.pid, over: o.bytes > Config.orphanBytes, now: now)
+            guard o.bytes > Config.orphanBytes else { continue }
+            if dur >= Config.orphanAlertAfter {
+                orphanOver = true
+                alert(key: "orphan:\(o.pid)", value: Double(o.bytes),
+                      text: "Huérfano \(o.name) usa \(formatBytes(o.bytes)) (pid \(o.pid))", now: now)
+            }
+            if dur >= Config.orphanCloseAfter, autoClose, !pauseActive(until: pausedUntil, now: now),
+               !closedAttempted.contains(o.pid) {
+                closedAttempted.insert(o.pid)
+                close(o)
+            }
+        }
+        lastAlert = lastAlert.filter { k, _ in
+            if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
+            if k.hasPrefix("orphan:") { return orphanPids.contains(pid_t(k.dropFirst(7)) ?? -1) }
+            return true
+        }
 
         // Memoria del sistema (el "valor" es la presión usada: crece cuando baja la libre).
         let systemLow = snap.freePercent < Config.systemFreeMinPercent
@@ -289,11 +444,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   text: "Memoria libre baja: \(snap.freePercent)%", now: now)
         }
 
-        updateUI(snap, alerting: anyOver || systemLow)
+        updateUI(snap, alerting: anyOver || systemLow || orphanOver)
         schedule(snap.sessions.isEmpty ? Config.pollIdle : Config.pollActive)
     }
 
+    /// SIGTERM al huérfano y sus descendientes (hijos primero), tras reverificar con un snapshot nuevo.
+    private func close(_ o: OrphanProc) {
+        guard let fresh = takeSnapshot().orphans.first(where: { $0.pid == o.pid }), parentPid(o.pid) == 1 else { return }
+        for pid in fresh.tree.reversed() { kill(pid, SIGTERM) }
+        notifier.send("Cerrado huérfano \(fresh.name) (\(formatBytes(fresh.bytes)), pid \(fresh.pid))")
+    }
+
     private func alert(key: String, value: Double, text: String, now: Date) {
+        guard !pauseActive(until: pausedUntil, now: now) else { return }
         if let last = lastAlert[key] {
             let cooled = now.timeIntervalSince(last.date) >= Config.cooldown
             let grew = value > last.value * Config.regrowthFactor
@@ -303,7 +466,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notifier.send(text)
     }
 
+    @objc private func toggleAutoClose() { autoClose.toggle(); refreshMenu() }
+
+    @objc private func togglePause() {
+        pausedUntil = pauseActive(until: pausedUntil, now: Date()) ? nil : Date().addingTimeInterval(Config.pauseDuration)
+        refreshMenu()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        if FileManager.default.fileExists(atPath: agentURL.path) {
+            try? FileManager.default.removeItem(at: agentURL)
+        } else if let exe = Bundle.main.executablePath {
+            try? FileManager.default.createDirectory(at: agentURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let data = try? PropertyListSerialization.data(fromPropertyList: launchAgentPlist(executable: exe), format: .xml, options: 0) {
+                try? data.write(to: agentURL)
+            }
+        }
+        refreshMenu()
+    }
+
+    @objc private func quit() { exit(0) }   // status 0: KeepAlive { SuccessfulExit = false } no relanza
+
+    private func refreshMenu() { if let s = lastSnap { updateUI(s, alerting: lastAlerting) } }
+
+    private func toggle(_ title: String, _ action: Selector, on: Bool) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.state = on ? .on : .off
+        return item
+    }
+
     private func updateUI(_ snap: Snapshot, alerting: Bool) {
+        lastSnap = snap
+        lastAlerting = alerting
         if let button = statusItem.button {
             let base = NSImage(systemSymbolName: "memorychip", accessibilityDescription: "Guachiman")
             if alerting {
@@ -329,6 +524,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 menu.addItem(disabled("\(s.label) — \(formatBytes(s.bytes)) (pid \(s.pid))"))
             }
         }
+        for o in snap.orphans {
+            menu.addItem(disabled("Huérfano \(o.name) — \(formatBytes(o.bytes)) (pid \(o.pid))"))
+        }
         if !notifier.isAuthorized {
             let item = NSMenuItem(title: "Activar notificaciones…", action: #selector(openNotificationSettings), keyEquivalent: "")
             item.target = self
@@ -336,7 +534,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Salir", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let now = Date()
+        if pauseActive(until: pausedUntil, now: now), let until = pausedUntil {
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm"
+            menu.addItem(toggle("Reanudar (pausado hasta \(f.string(from: until)))", #selector(togglePause), on: false))
+        } else {
+            menu.addItem(toggle("Pausar 1 h", #selector(togglePause), on: false))
+        }
+        menu.addItem(toggle("Cerrar huérfanos automáticamente", #selector(toggleAutoClose), on: autoClose))
+        menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
+                            on: FileManager.default.fileExists(atPath: agentURL.path)))
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "Salir", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
         statusItem.menu = menu
     }
 
@@ -351,6 +563,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 if CommandLine.arguments.contains("--once") {
     runOnce()
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--selftest") {
+    runSelfTest()
+    exit(0)
+}
+
+// Instancia única: si ya corre otra app con el mismo bundle id, salir sin error.
+if let id = Bundle.main.bundleIdentifier,
+   NSRunningApplication.runningApplications(withBundleIdentifier: id)
+       .contains(where: { $0.processIdentifier != getpid() }) {
     exit(0)
 }
 
