@@ -29,6 +29,7 @@ enum Config {
     static let pauseDuration: TimeInterval = 3600
     static let autoCloseKey = "autoCloseOrphans"
     static let aiKey = "aiEnabled"
+    static let relayIdleStop: TimeInterval = 300   // relay apagado tras 5 min seguidos sin alerta activa
     static let loginText = "Inicia sesión en Claude Code: abre la terminal y ejecuta `claude`"
     static let agentLabel = "io.github.guachiman"
     static let supportDir = FileManager.default.homeDirectoryForCurrentUser
@@ -233,6 +234,107 @@ func claudeLoggedIn(_ claude: String) -> Bool {
     return p.terminationStatus == 0 && parseAuthLoggedIn(data)
 }
 
+// MARK: - Uso de Claude (límites del plan; solo lectura, sin refrescar jamás el token de Claude Code)
+
+struct UsageLimit: Equatable {
+    let label: String
+    let percent: Int
+    let severity: String
+    let resetsAt: Date?
+}
+
+/// Token OAuth desde el JSON del llavero (`claudeAiOauth`); nil si falta o ya venció (`expiresAt` en ms).
+func parseOAuthToken(_ data: Data, now: Date) -> String? {
+    guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let c = o["claudeAiOauth"] as? [String: Any],
+          let token = c["accessToken"] as? String, !token.isEmpty else { return nil }
+    if let exp = (c["expiresAt"] as? NSNumber)?.doubleValue, exp / 1000 <= now.timeIntervalSince1970 { return nil }
+    return token
+}
+
+/// Interpreta `/api/oauth/usage`: nil si el formato no es el esperado; ignora los límites desconocidos o incompletos.
+func parseUsageLimits(_ data: Data) -> [UsageLimit]? {
+    guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let arr = o["limits"] as? [[String: Any]] else { return nil }
+    let frac = ISO8601DateFormatter()
+    frac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let plain = ISO8601DateFormatter()
+    return arr.compactMap { l in
+        guard let kind = l["kind"] as? String, let pct = (l["percent"] as? NSNumber)?.intValue else { return nil }
+        let label: String
+        switch kind {
+        case "session": label = "Sesión (5 h)"
+        case "weekly_all": label = "Semanal"
+        case "weekly_scoped":
+            let name = ((l["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
+            label = "Semanal · " + (name ?? "modelo")
+        default: return nil
+        }
+        let reset = (l["resets_at"] as? String).flatMap { frac.date(from: $0) ?? plain.date(from: $0) }
+        return UsageLimit(label: label, percent: max(0, pct), severity: l["severity"] as? String ?? "normal", resetsAt: reset)
+    }
+}
+
+/// "HH:mm" si el reinicio es hoy; si no, día corto + hora ("mié 14:30").
+func usageResetText(_ d: Date, now: Date, calendar: Calendar = .current) -> String {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "es")
+    f.timeZone = calendar.timeZone
+    f.dateFormat = calendar.isDate(d, inSameDayAs: now) ? "HH:mm" : "EEE HH:mm"
+    // Redondeo al minuto: la API a veces devuelve 22:59:59.x en vez de 23:00.
+    let m = Date(timeIntervalSinceReferenceDate: (d.timeIntervalSinceReferenceDate / 60).rounded() * 60)
+    return f.string(from: m).replacingOccurrences(of: ".", with: "")
+}
+
+/// Pide los límites sin bloquear el hilo principal; `done` se llama en main con nil si no hay datos.
+func fetchClaudeUsage(done: @escaping ([UsageLimit]?) -> Void) {
+    DispatchQueue.global(qos: .utility).async {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-a", NSUserName(), "-w"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return DispatchQueue.main.async { done(nil) } }
+        let out = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, let token = parseOAuthToken(out, now: Date()) else {
+            return DispatchQueue.main.async { done(nil) }
+        }
+        // curl con la config por stdin: el token nunca aparece en argv (visible con `ps`).
+        let c = Process()
+        c.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        c.arguments = ["-sS", "-m", "10", "-K", "-", "-w", "\n%{http_code}", "https://api.anthropic.com/api/oauth/usage"]
+        let inPipe = Pipe(), outPipe = Pipe()
+        c.standardInput = inPipe
+        c.standardOutput = outPipe
+        c.standardError = FileHandle.nullDevice
+        guard (try? c.run()) != nil else { return DispatchQueue.main.async { done(nil) } }
+        inPipe.fileHandleForWriting.write(Data("header = \"Authorization: Bearer \(token)\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\n".utf8))
+        inPipe.fileHandleForWriting.closeFile()
+        let body = outPipe.fileHandleForReading.readDataToEndOfFile()
+        c.waitUntilExit()
+        var limits: [UsageLimit]?
+        if c.terminationStatus == 0, let nl = body.lastIndex(of: 10),
+           String(decoding: body[body.index(after: nl)...], as: UTF8.self) == "200" {
+            limits = parseUsageLimits(body[..<nl])
+        }
+        DispatchQueue.main.async { done(limits) }
+    }
+}
+
+/// El relay corriendo se apaga cuando no hay condición de alerta (roja) de forma continua durante `Config.relayIdleStop`.
+func relayShouldStop(running: Bool, quietSince: Date?, now: Date) -> Bool {
+    running && quietSince.map { now.timeIntervalSince($0) >= Config.relayIdleStop } ?? false
+}
+
+/// Vacía `alerts.jsonl`: el relay lee el archivo desde el inicio (`tail -n +1`), así que no debe quedar nada de un ciclo anterior.
+func truncateAlerts(path: String = Config.alertsFile) {
+    guard FileManager.default.fileExists(atPath: path) else { return }
+    try? Data().write(to: URL(fileURLWithPath: path))
+}
+
 /// Ejecuta `start.sh [arg]` del bundle; con `wait` espera a que termine (para detener al salir).
 func runRelay(_ arg: String?, wait: Bool) {
     guard let claude = claudeBinary(),
@@ -376,6 +478,31 @@ func runSelfTest() {
     precondition(!parseAuthLoggedIn(Data(#"{"loggedIn":false}"#.utf8)))
     precondition(!parseAuthLoggedIn(Data("basura".utf8)))
     precondition(!parseAuthLoggedIn(Data(#"{"loggedIn":"true"}"#.utf8)))
+    let tokJSON = #"{"claudeAiOauth":{"accessToken":"tk","expiresAt":2000000}}"#
+    precondition(parseOAuthToken(Data(tokJSON.utf8), now: Date(timeIntervalSince1970: 1000)) == "tk")
+    precondition(parseOAuthToken(Data(tokJSON.utf8), now: Date(timeIntervalSince1970: 2000)) == nil)   // vencido
+    precondition(parseOAuthToken(Data("basura".utf8), now: Date()) == nil)
+    let usageJSON = #"""
+    {"limits":[{"kind":"session","percent":42,"severity":"normal","resets_at":"2026-10-28T19:30:00.123456+00:00"},
+    {"kind":"weekly_all","percent":80,"severity":"warning","resets_at":"2026-10-30T10:00:00+00:00"},
+    {"kind":"weekly_scoped","percent":5,"severity":"normal","scope":{"model":{"display_name":"Opus"}}},
+    {"kind":"otro","percent":1},{"kind":"session"}]}
+    """#
+    let ul = parseUsageLimits(Data(usageJSON.utf8))
+    precondition(ul?.map(\.label) == ["Sesión (5 h)", "Semanal", "Semanal · Opus"] && ul?.map(\.percent) == [42, 80, 5])
+    precondition(abs((ul?[0].resetsAt?.timeIntervalSince1970 ?? 0) - 1_793_215_800.123) < 0.01)   // con fracción de segundo
+    precondition(ul?[1].severity == "warning" && ul?[2].resetsAt == nil)
+    precondition(parseUsageLimits(Data("basura".utf8)) == nil && parseUsageLimits(Data(#"{"x":1}"#.utf8)) == nil)
+    var utc = Calendar(identifier: .gregorian)
+    utc.timeZone = TimeZone(identifier: "UTC")!
+    let uNow = Date(timeIntervalSince1970: 1_793_200_000)
+    precondition(usageResetText(uNow.addingTimeInterval(3600), now: uNow, calendar: utc).count == 5)       // HH:mm
+    precondition(usageResetText(uNow.addingTimeInterval(2 * 86400), now: uNow, calendar: utc).count > 5)   // día + hora
+    let q0 = Date(timeIntervalSince1970: 1000)
+    precondition(!relayShouldStop(running: true, quietSince: nil, now: q0))
+    precondition(!relayShouldStop(running: true, quietSince: q0, now: q0 + Config.relayIdleStop - 1))
+    precondition(relayShouldStop(running: true, quietSince: q0, now: q0 + Config.relayIdleStop))
+    precondition(!relayShouldStop(running: false, quietSince: q0, now: q0 + 9999))
     var top: TopChild?
     top = largerChild(top, pid: 10, bytes: 999, root: 10)            // la raíz no cuenta
     precondition(top == nil)
@@ -978,6 +1105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastIdle: [String: TimeInterval] = [:]
     private var rowTargets: [KillTarget] = []
     private var panel: IslandPanel?
+    private var usageLimits: [UsageLimit]?   // último resultado (nil = sin datos)
+    private var usageFetchedAt: Date?       // caché de 5 min; sin timers, solo se consulta al abrir el panel
+    private var usageFetching = false
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var menuOpen = false
@@ -995,6 +1125,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set { UserDefaults.standard.set(newValue, forKey: Config.aiKey) }
     }
     private var aiLoginFailed = false
+    private var relayRunning = false         // el relay se lanzó bajo demanda y aún no se detuvo
+    private var relayQuietSince: Date?       // desde cuándo no hay sesión ni huérfano en alerta
     private var termSource: DispatchSourceSignal?
     private var lastAlert: [String: (date: Date, value: Double)] = [:]
     private var timer: Timer?
@@ -1007,7 +1139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Limpieza única del directorio `pending/` de versiones anteriores (inofensiva si no existe).
         try? FileManager.default.removeItem(atPath: Config.supportDir + "/pending")
-        _ = ensureRelay()
+        truncateAlerts()   // el relay es bajo demanda: al arrancar no hay ciclo anterior
+        if aiEnabled { _ = checkAILogin() }
         // SIGTERM (p. ej. `brew services stop`): detiene el relay antes de salir.
         signal(SIGTERM, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -1089,6 +1222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     var text = "Sesión \(sessionLabel(s)) usa \(formatBytes(s.bytes)) (pid \(s.pid))"
                     if let t = s.top { text += " (mayor: \(t.cmd) \(formatBytes(t.bytes)))" }
                     if alert(key: "session:\(s.pid)", value: Double(s.bytes), text: text, now: now), aiEnabled {
+                        startRelayIfNeeded()
                         appendAlert(sessionAlertLine(
                             ts: Int(now.timeIntervalSince1970), pid: s.pid, mb: s.bytes / 1_048_576,
                             limitMB: limit / 1_048_576, cwd: s.cwd, title: cachedSessionTitle(pid: s.pid), top: s.top))
@@ -1111,6 +1245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 orphanOver = true
                 if alert(key: "orphan:\(o.pid)", value: Double(o.bytes),
                          text: "Huérfano \(o.name) usa \(formatBytes(o.bytes)) (pid \(o.pid))", now: now), aiEnabled {
+                    startRelayIfNeeded()
                     appendAlert(orphanAlertLine(
                         ts: Int(now.timeIntervalSince1970), pid: o.pid, name: o.name, mb: o.bytes / 1_048_576,
                         limitMB: Config.orphanBytes / 1_048_576, cwd: currentDirectory(o.pid) ?? ""))
@@ -1124,6 +1259,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Apps: RAM > 15% sostenida 60 s, CPU > 80% de un núcleo sostenida 120 s. Solo avisa, nunca cierra.
+        // Relay bajo demanda: se apaga tras 5 min continuos sin sesión ni huérfano en alerta (el amarillo no lo mantiene).
+        relayQuietSince = anyOver || orphanOver ? nil : (relayQuietSince ?? now)
+        if relayShouldStop(running: relayRunning, quietSince: relayQuietSince, now: now) { stopRelay(wait: false) }
         var appOver = false
         let appKeys = Set(snap.apps.map { $0.key })
         appRamTracker.retain(appKeys)
@@ -1199,28 +1337,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationWillTerminate(_ notification: Notification) { runRelay("stop", wait: true) }
+    func applicationWillTerminate(_ notification: Notification) { stopRelay(wait: true) }
 
     @objc private func quit() {
-        runRelay("stop", wait: true)
+        stopRelay(wait: true)
         exit(0)
     }
 
-    /// Con la IA activa y Claude Code con sesión, arranca el relay (idempotente). Devuelve false si falta la sesión.
-    private func ensureRelay() -> Bool {
+    /// Detiene el relay y vacía las alertas para que el próximo ciclo empiece limpio.
+    private func stopRelay(wait: Bool) {
+        runRelay("stop", wait: wait)
+        truncateAlerts()
+        relayRunning = false
+        relayQuietSince = nil
+    }
+
+    /// Arranca el relay bajo demanda (antes de escribir una alerta); no relanza mientras esté arrancando o corriendo.
+    private func startRelayIfNeeded() {
+        guard aiEnabled, !aiLoginFailed, !relayRunning, claudeBinary() != nil else { return }
+        relayRunning = true
+        relayQuietSince = nil
+        runRelay(nil, wait: false)
+    }
+
+    /// Con la IA activa, comprueba que Claude Code tenga sesión (no arranca nada). Devuelve false si falta.
+    private func checkAILogin() -> Bool {
         guard aiEnabled, let claude = claudeBinary() else { return true }
         aiLoginFailed = !claudeLoggedIn(claude)
-        if !aiLoginFailed { runRelay(nil, wait: false) }
         return !aiLoginFailed
     }
 
     @objc private func toggleAI(_ sender: NSButton) {
         aiEnabled.toggle()
         if aiEnabled {
-            if !ensureRelay() { notifier.send(Config.loginText) }
+            if !checkAILogin() { notifier.send(Config.loginText) }
         } else {
             aiLoginFailed = false
-            runRelay("stop", wait: false)
+            stopRelay(wait: false)
         }
         if let p = panel { fillPanel(p) }
     }   // status 0: KeepAlive { SuccessfulExit = false } no relanza
@@ -1299,7 +1452,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         p.isReleasedWhenClosed = false
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel = p
-        if aiEnabled, aiLoginFailed { _ = ensureRelay() }   // reintento solo al abrir el panel
+        if aiEnabled, aiLoginFailed { _ = checkAILogin() }   // reintento solo al abrir el panel
+        refreshUsage()
         fillPanel(p)
         p.alphaValue = 0
         p.makeKeyAndOrderFront(nil)
@@ -1315,6 +1469,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.closePanel()
             }
             return e
+        }
+    }
+
+    /// Consulta los límites si la caché venció (5 min) y redibuja el panel si sigue abierto al terminar.
+    private func refreshUsage() {
+        guard claudeBinary() != nil, !usageFetching,
+              usageFetchedAt.map({ Date().timeIntervalSince($0) > 300 }) ?? true else { return }
+        usageFetching = true
+        fetchClaudeUsage { [weak self] limits in
+            guard let self else { return }
+            self.usageFetching = false
+            self.usageLimits = limits
+            self.usageFetchedAt = Date()
+            if let p = self.panel { self.fillPanel(p) }
         }
     }
 
@@ -1461,7 +1629,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             y += rowH
         }
 
-        divider(topMargin: 0)
+        if claudeBinary() != nil {
+            divider(topMargin: 0)
+            section("Uso de Claude")
+            let limits = usageLimits ?? []
+            if limits.isEmpty {
+                root.addSubview(panelLabel(usageFetchedAt == nil ? "Cargando…" : "sin datos", size: 12.5, color: Pal.muted,
+                                           frame: NSRect(x: pad + 8, y: y + 4, width: iw - 16, height: 16)))
+                y += rowH
+            }
+            let now = Date()
+            for u in limits {
+                let tint: NSColor = u.severity == "normal" && u.percent < 90 ? Pal.primary
+                    : (["critical", "exceeded", "danger", "error"].contains(u.severity) || u.percent >= 90 ? Pal.destructive : .systemYellow)
+                let reset = u.resetsAt.map { " · " + usageResetText($0, now: now) } ?? ""
+                root.addSubview(panelLabel(u.label, size: 12.5,
+                                           frame: NSRect(x: pad + 8, y: y + 3, width: iw - 16 - 110, height: 16)))
+                root.addSubview(panelLabel("\(u.percent)%\(reset)", size: 11, mono: true,
+                                           color: u.severity == "normal" ? Pal.muted : tint, align: .right,
+                                           frame: NSRect(x: pad + iw - 8 - 110, y: y + 3, width: 110, height: 16)))
+                let track = NSView(frame: NSRect(x: pad + 8, y: y + 3 + 16 + 3, width: iw - 16, height: 4))
+                track.wantsLayer = true
+                track.layer?.backgroundColor = Pal.accent.cgColor
+                track.layer?.cornerRadius = 2
+                track.setAccessibilityElement(true)
+                track.setAccessibilityRole(.image)
+                track.setAccessibilityLabel("\(u.label) \(u.percent) %")
+                let bar = NSView(frame: NSRect(x: 0, y: 0, width: (iw - 16) * CGFloat(max(0, min(100, u.percent))) / 100, height: 4))
+                bar.wantsLayer = true
+                bar.layer?.backgroundColor = tint.cgColor
+                bar.layer?.cornerRadius = 2
+                track.addSubview(bar)
+                root.addSubview(track)
+                y += 34
+            }
+        }
+
+        divider(topMargin: claudeBinary() != nil ? 2 : 0)
         section("Sesiones de Claude", total: sessions.isEmpty ? nil : formatBytes(sessions.reduce(0) { $0 + $1.bytes }))
         if sessions.isEmpty {
             root.addSubview(panelLabel("Sin sesiones de Claude", size: 12.5, color: Pal.muted,
@@ -1691,6 +1895,19 @@ func installCopyInApplications() {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         if fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
         try fm.copyItem(at: src, to: target)
+        // Homebrew borra las versiones viejas del Cellar, pero LaunchServices conserva sus registros y las notificaciones salen con ícono en blanco.
+        let snippet = #"""
+        LS=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+        "$LS" -dump | sed -n 's/^path: *\(.*Guachiman\.app\) (0x.*/\1/p' | sort -u | while read -r p; do [ -d "$p" ] || "$LS" -u "$p"; done
+        "$LS" -f "$HOME/Applications/Guachiman.app"
+        killall usernoted NotificationCenter 2>/dev/null
+        """#
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", snippet]
+        p.standardOutput = nil
+        p.standardError = nil
+        try? p.run()
     } catch {
         FileHandle.standardError.write(Data("guachiman: no se pudo copiar a ~/Applications: \(error)\n".utf8))
     }

@@ -22,19 +22,19 @@ Una sesión de Claude Code en segundo plano (Haiku) que lee las alertas de memor
 
 ## Costo
 
-- Unos 386 MB de RAM mientras el botón IA está encendido.
+- Unos 386 MB de RAM (y el daemon de Claude Code) solo mientras el relay está corriendo: se arranca bajo demanda y se apaga solo. Con la IA encendida y sin alertas, no hay ningún proceso del relay.
 - Tokens de Haiku por cada alerta y por cada re-armado del monitor (máximo cada 30 min).
 
 ## Cómo se activa
 
-Lo gestiona Guachiman con el botón **IA** del panel (apagado por defecto). Al encender, o al abrir la app con la IA encendida, ejecuta `/bin/bash <app>/Contents/Resources/relay/start.sh`; al apagar o al "Salir" ejecuta `start.sh stop`. `make` copia `start.sh` y `brief.md` dentro del bundle, así que las instalaciones con Homebrew también los traen. Ya no existe el LaunchAgent del relay.
+Lo gestiona Guachiman con el botón **IA** del panel (apagado por defecto), que significa "permitido arrancar solo". Al encender solo se comprueba que Claude Code tenga sesión iniciada. El relay arranca bajo demanda: justo antes de escribir una alerta de sesión o de huérfano en `alerts.jsonl`, si no está corriendo, ejecuta `/bin/bash <app>/Contents/Resources/relay/start.sh` (no se relanza en cada sondeo). Se detiene con `start.sh stop` tras 5 minutos seguidos sin ninguna sesión ni huérfano en alerta (el amarillo no cuenta), al apagar el botón y al "Salir". Cada vez que el relay se detiene, y al abrir la app, `alerts.jsonl` se vacía; el monitor del relay usa `tail -n +1 -F`, así que lee desde el inicio las alertas del ciclo actual y no se pierde la primera. `make` copia `start.sh` y `brief.md` dentro del bundle, así que las instalaciones con Homebrew también los traen. Ya no existe el LaunchAgent del relay.
 
 Si vienes de la versión anterior y la instalaste a mano: `launchctl bootout gui/$(id -u)/io.github.guachiman.relay`, borra `~/Library/LaunchAgents/io.github.guachiman.relay.plist` y `~/Library/Application Support/Guachiman/relay`.
 
 Notas:
 - Guachiman busca el CLI en `~/.local/bin/claude`, `/opt/homebrew/bin/claude` y `/usr/local/bin/claude` y se lo pasa al script en `CLAUDE_BIN`. Antes de arrancar comprueba `claude auth status --json`; sin sesión iniciada avisa en el panel y no arranca.
 - **Limitación de confianza**: `claude --bg` se niega a correr en un workspace no confiable y no existe una opción para saltarlo. El relay usa `~/Library/Application Support/Guachiman/relay-cwd` (o `RELAY_CWD`): ejecuta `claude` una vez en ese directorio y acepta la confianza. Mientras no lo hagas, el relay no arranca. No se usan carpetas protegidas como `~/Documents`, porque sin permiso de TCC la app queda colgada al entrar en ellas.
-- `start.sh` es idempotente: si ya hay una sesión `guachiman-relay` viva, no hace nada. Para recargar `brief.md`, apaga y enciende el botón IA.
+- `start.sh` es idempotente: si ya hay una sesión `guachiman-relay` viva, no hace nada. Para recargar `brief.md`, apaga y enciende el botón IA (o espera a que el relay se apague solo).
 
 ## Verificar que corre
 
