@@ -843,40 +843,27 @@ final class IslandPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// Anillo con el porcentaje de memoria libre al centro.
-final class RingGauge: NSView {
-    var percent = 0
-    var color = NSColor.systemGreen
-
-    override func draw(_ dirtyRect: NSRect) {
-        let c = NSPoint(x: bounds.midX, y: bounds.midY)
-        let radius = min(bounds.width, bounds.height) / 2 - 5
-        let track = NSBezierPath()
-        track.appendArc(withCenter: c, radius: radius, startAngle: 0, endAngle: 360)
-        track.lineWidth = 7
-        NSColor(white: 1, alpha: 0.14).setStroke()
-        track.stroke()
-        if percent > 0 {
-            let arc = NSBezierPath()
-            arc.appendArc(withCenter: c, radius: radius, startAngle: 90,
-                          endAngle: 90 - 360 * CGFloat(min(percent, 100)) / 100, clockwise: true)
-            arc.lineWidth = 7
-            arc.lineCapStyle = .round
-            color.setStroke()
-            arc.stroke()
-        }
-        let s = NSAttributedString(string: "\(percent)%", attributes: [
-            .font: NSFont.systemFont(ofSize: 20, weight: .semibold), .foregroundColor: NSColor.white])
-        let size = s.size()
-        s.draw(at: NSPoint(x: c.x - size.width / 2, y: c.y - size.height / 2))
+/// Paleta del popover (tokens oscuros del diseño).
+enum Pal {
+    static func hex(_ v: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((v >> 16) & 255) / 255, green: CGFloat((v >> 8) & 255) / 255,
+                blue: CGFloat(v & 255) / 255, alpha: 1)
     }
+    static let popover = hex(0x151a18)
+    static let foreground = hex(0xedf2ef)
+    static let muted = hex(0x94a09a)
+    static let accent = hex(0x1e2523)
+    static let primary = hex(0x00d495)
+    static let destructive = hex(0xe5484d)
+    static let border = hex(0x252c29)
 }
 
-func panelLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, alpha: CGFloat = 1,
-                align: NSTextAlignment = .left, frame: NSRect) -> NSTextField {
+func panelLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, mono: Bool = false,
+                color: NSColor = Pal.foreground, align: NSTextAlignment = .left, frame: NSRect) -> NSTextField {
     let l = NSTextField(labelWithString: text)
-    l.font = NSFont.systemFont(ofSize: size, weight: weight)
-    l.textColor = NSColor(white: 1, alpha: alpha)
+    l.font = mono ? NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+        : NSFont.systemFont(ofSize: size, weight: weight)
+    l.textColor = color
     l.alignment = align
     l.lineBreakMode = .byTruncatingTail
     l.maximumNumberOfLines = 1
@@ -884,40 +871,96 @@ func panelLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
     return l
 }
 
-/// Fila del panel: círculo de estado, nombre, "1,2 GB · 3 %" y botón de detener al borde derecho.
+/// Botón sin borde con fondo `accent` al pasar el cursor (IA y ajustes).
+final class HoverButton: NSButton {
+    private var area: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area { removeTrackingArea(area) }
+        let a = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(a)
+        area = a
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if isEnabled { layer?.backgroundColor = Pal.accent.cgColor }
+    }
+
+    override func mouseExited(with event: NSEvent) { layer?.backgroundColor = nil }
+}
+
+/// Fila del panel: punto de estado, nombre, memoria y, a la derecha, CPU (o botón de detener al pasar el cursor).
 final class PanelRow: FlippedView {
     static let height: CGFloat = 24
+    private let cpuLabel: NSTextField
+    private var stopButton: NSButton?
+    private var area: NSTrackingArea?
 
-    init(width: CGFloat, text: String, detail: String, color: NSColor, stopTag: Int?, stopLabel: String,
-         target: AnyObject, action: Selector) {
+    init(width: CGFloat, text: String, memory: String, cpu: String, color: NSColor, stopTag: Int?, stopLabel: String,
+         stopTip: String, target: AnyObject, action: Selector) {
+        let colW: CGFloat = 30, memW: CGFloat = 64
+        let colX = width - 8 - colW
+        let memX = colX - 8 - memW
+        cpuLabel = panelLabel(cpu, size: 11, mono: true, color: Pal.muted, align: .right,
+                              frame: NSRect(x: colX, y: 5, width: colW, height: 14))
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: PanelRow.height))
-        let dot = NSView(frame: NSRect(x: 0, y: 8, width: 8, height: 8))
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        let dot = NSView(frame: NSRect(x: 8, y: 9, width: 6, height: 6))
         dot.wantsLayer = true
         dot.layer?.backgroundColor = color.cgColor
-        dot.layer?.cornerRadius = 4
+        dot.layer?.cornerRadius = 3
         addSubview(dot)
-        let detailW: CGFloat = 86
-        let detailX = width - 22 - detailW
-        addSubview(panelLabel(text, size: 12, frame: NSRect(x: 16, y: 4, width: detailX - 22, height: 16)))
-        addSubview(panelLabel(detail, size: 11, alpha: 0.6, align: .right,
-                              frame: NSRect(x: detailX, y: 5, width: detailW, height: 14)))
+        addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22, height: 16)))
+        addSubview(panelLabel(memory, size: 11, mono: true, color: Pal.muted, align: .right,
+                              frame: NSRect(x: memX, y: 5, width: memW, height: 14)))
+        addSubview(cpuLabel)
         if let stopTag {
-            let button = NSButton(frame: NSRect(x: width - 16, y: 4, width: 16, height: 16))
-            button.image = NSImage(systemSymbolName: "stop.circle", accessibilityDescription: nil)?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
-            button.imagePosition = .imageOnly
-            button.isBordered = false
-            button.contentTintColor = .secondaryLabelColor
-            button.toolTip = "Cerrar"
-            button.setAccessibilityLabel(stopLabel)
-            button.tag = stopTag
-            button.target = target
-            button.action = action
-            addSubview(button)
+            let b = NSButton(frame: NSRect(x: width - 8 - 18, y: 3, width: 18, height: 18))
+            b.image = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { r in
+                NSColor.white.setFill()
+                NSBezierPath(roundedRect: r, xRadius: 1.5, yRadius: 1.5).fill()
+                return true
+            }
+            b.imagePosition = .imageOnly
+            b.imageScaling = .scaleNone
+            b.isBordered = false
+            b.wantsLayer = true
+            b.layer?.backgroundColor = Pal.destructive.cgColor
+            b.layer?.cornerRadius = 4
+            b.toolTip = stopTip
+            b.setAccessibilityLabel(stopLabel)
+            b.tag = stopTag
+            b.target = target
+            b.action = action
+            b.isHidden = true
+            addSubview(b)
+            stopButton = b
         }
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area { removeTrackingArea(area) }
+        let a = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(a)
+        area = a
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        layer?.backgroundColor = Pal.accent.cgColor
+        if let stopButton { cpuLabel.isHidden = true; stopButton.isHidden = false }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        layer?.backgroundColor = nil
+        if let stopButton { cpuLabel.isHidden = false; stopButton.isHidden = true }
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1220,10 +1263,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func nsColor(_ c: RowColor) -> NSColor {
         switch c {
-        case .green: return .systemGreen
+        case .green: return Pal.primary
         case .yellow: return .systemYellow
-        case .red: return .systemRed
-        case .gray: return .systemGray
+        case .red: return Pal.destructive
+        case .gray: return Pal.muted
         }
     }
 
@@ -1231,7 +1274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openPanel() {
         guard panel == nil, statusItem.button?.window != nil else { return }
-        let p = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 730, height: 170),
+        let p = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 170),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.isOpaque = false
         p.backgroundColor = .clear
@@ -1277,127 +1320,164 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Reconstruye el contenido a partir del último snapshot y recoloca el panel bajo el ícono.
     private func fillPanel(_ p: IslandPanel) {
         let snap = lastSnap ?? Snapshot(sessions: [], orphans: [], apps: [], freePercent: 100)
-        let leftW: CGFloat = 130, colW: CGFloat = 300, W = leftW + 2 * colW, rowH = PanelRow.height, rowsTop: CGFloat = 40
+        let W: CGFloat = 300, pad: CGFloat = 6, iw = W - 2 * pad, rowH = PanelRow.height
         let limit = UInt64(Double(memory) * Config.sessionFraction)
         let sessions = Array(snap.sessions.prefix(8))
         let orphans = Array(snap.orphans.prefix(4))
         let apps = Array(snap.apps.prefix(5))
-        let rightRows = apps.count + (orphans.isEmpty ? 0 : orphans.count + 1)
         let notice = aiEnabled && aiLoginFailed
-        let H = max(170, rowsTop + CGFloat(max(max(sessions.count, 1), rightRows)) * rowH + 18) + (notice ? 16 : 0)
 
-        let root = FlippedView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+        let root = FlippedView(frame: NSRect(x: 0, y: 0, width: W, height: 100))
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor.black.cgColor
-        root.layer?.cornerRadius = 20
+        root.layer?.backgroundColor = Pal.popover.cgColor
+        root.layer?.cornerRadius = 12
         root.layer?.masksToBounds = true
+        root.layer?.borderWidth = 0.5
+        root.layer?.borderColor = NSColor(white: 1, alpha: 0.12).cgColor
 
-        // Izquierda: anillo de memoria libre y CPU total.
-        let gauge = RingGauge(frame: NSRect(x: (leftW - 84) / 2, y: 18, width: 84, height: 84))
-        gauge.percent = snap.freePercent
-        gauge.color = nsColor(freeMemoryColor(freePercent: snap.freePercent))
-        gauge.setAccessibilityElement(true)
-        gauge.setAccessibilityRole(.image)
-        gauge.setAccessibilityLabel("Memoria libre \(snap.freePercent) %")
-        root.addSubview(gauge)
-        let cpuText = cpuTotal.map { "\(Int($0.rounded())) %" } ?? "—"
-        root.addSubview(panelLabel(cpuText, size: 15, weight: .semibold, align: .center,
-                                   frame: NSRect(x: 0, y: 112, width: leftW, height: 20)))
-        root.addSubview(panelLabel("CPU total", size: 10.5, alpha: 0.55, align: .center,
-                                   frame: NSRect(x: 0, y: 132, width: leftW, height: 14)))
+        var y = pad
 
-        for x in [leftW, leftW + colW] {
-            let d = NSView(frame: NSRect(x: x, y: 16, width: 1, height: H - 32))
-            d.wantsLayer = true
-            d.layer?.backgroundColor = NSColor(white: 1, alpha: 0.12).cgColor
-            root.addSubview(d)
+        // Cabecera: dos medidores y los botones IA / ajustes.
+        let btnW: CGFloat = 22 * 2 + 2
+        let meterW = (iw - 16 - btnW - 24) / 2
+        func meter(_ x: CGFloat, _ label: String, _ value: String, _ fraction: Double, _ fill: NSColor, _ a11y: String) {
+            root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 44, height: 14)))
+            root.addSubview(panelLabel(value, size: 12, weight: .semibold, mono: true, align: .right,
+                                       frame: NSRect(x: x + meterW - 48, y: y + 8, width: 48, height: 14)))
+            let track = NSView(frame: NSRect(x: x, y: y + 8 + 14 + 5, width: meterW, height: 4))
+            track.wantsLayer = true
+            track.layer?.backgroundColor = Pal.accent.cgColor
+            track.layer?.cornerRadius = 2
+            track.setAccessibilityElement(true)
+            track.setAccessibilityRole(.image)
+            track.setAccessibilityLabel(a11y)
+            let bar = NSView(frame: NSRect(x: 0, y: 0, width: meterW * CGFloat(max(0, min(1, fraction))), height: 4))
+            bar.wantsLayer = true
+            bar.layer?.backgroundColor = fill.cgColor
+            bar.layer?.cornerRadius = 2
+            track.addSubview(bar)
+            root.addSubview(track)
         }
+        meter(pad + 8, "Memoria libre", "\(snap.freePercent)%", Double(snap.freePercent) / 100,
+              nsColor(freeMemoryColor(freePercent: snap.freePercent)), "Memoria libre \(snap.freePercent) %")
+        meter(pad + 8 + meterW + 12, "CPU", cpuTotal.map { "\(Int($0.rounded()))%" } ?? "—", (cpuTotal ?? 0) / 100,
+              Pal.primary, cpuTotal.map { "CPU \(Int($0.rounded())) %" } ?? "CPU no disponible")
 
-        rowTargets = []
-        func addRow(_ x: CGFloat, _ y: CGFloat, _ text: String, _ detail: String, _ color: RowColor, _ t: KillTarget) {
-            var tag: Int?
-            if !t.pids.isEmpty, !t.pids.contains(getpid()) {   // nunca ofrece cerrar a Guachiman
-                rowTargets.append(t)
-                tag = rowTargets.count - 1
-            }
-            let r = PanelRow(width: colW - 32, text: text, detail: detail, color: nsColor(color), stopTag: tag,
-                             stopLabel: "Cerrar \(t.name)", target: self, action: #selector(stopClicked(_:)))
-            r.frame.origin = NSPoint(x: x + 16, y: y)
-            root.addSubview(r)
-        }
-        func header(_ text: String, _ x: CGFloat, _ y: CGFloat, width: CGFloat) {
-            root.addSubview(panelLabel(text, size: 10.5, weight: .semibold, alpha: 0.5,
-                                       frame: NSRect(x: x + 16, y: y, width: width, height: 14)))
-        }
-        func detail(_ bytes: UInt64, _ cpu: Double) -> String { "\(formatBytes(bytes)) · \(Int(cpu.rounded())) %" }
-
-        // Centro: sesiones de Claude.
-        header("Sesiones de Claude", leftW, 14, width: colW - 32)
-        if sessions.isEmpty {
-            root.addSubview(panelLabel("Sin sesiones de Claude", size: 12, alpha: 0.5,
-                                       frame: NSRect(x: leftW + 16, y: rowsTop + 4, width: colW - 32, height: 16)))
-        }
-        for (i, s) in sessions.enumerated() {
-            let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
-                             idleFor: lastIdle["session:\(s.pid)"] ?? 0)
-            let title = sessionTitle(pid: s.pid).map(truncatedTitle)
-            addRow(leftW, rowsTop + CGFloat(i) * rowH, title ?? s.label, detail(s.bytes, s.cpu), c,
-                   KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false))
-        }
-
-        // Derecha: apps que más consumen y huérfanos.
-        let rx = leftW + colW
-        header("Apps que más consumen", rx, 14, width: colW - 64)
-        for (i, a) in apps.enumerated() {
-            let c = rowColor(bytes: a.bytes, cpu: a.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
-                             idleFor: lastIdle[a.key] ?? 0)
-            let single = a.key.hasPrefix("pid:")
-            addRow(rx, rowsTop + CGFloat(i) * rowH, a.name, detail(a.bytes, a.cpu), c,
-                   KillTarget(name: a.name, bytes: a.bytes, pids: a.pids, appPath: single ? nil : a.key, expandTree: single))
-        }
-        if !orphans.isEmpty {
-            let hy = rowsTop + CGFloat(apps.count) * rowH + 6
-            header("Huérfanos", rx, hy, width: colW - 32)
-            for (i, o) in orphans.enumerated() {
-                let c = rowColor(bytes: o.bytes, cpu: o.cpu, ramLimit: Config.orphanBytes, cpuLimit: nil,
-                                 idleFor: lastIdle["orphan:\(o.pid)"] ?? 0)
-                addRow(rx, hy + 16 + CGFloat(i) * rowH, o.name, detail(o.bytes, o.cpu), c,
-                       KillTarget(name: o.name, bytes: o.bytes, pids: o.tree, appPath: nil, expandTree: false))
-            }
-        }
-
-        // Engranaje arriba a la derecha.
-        let gear = NSButton(frame: NSRect(x: W - 36, y: 10, width: 22, height: 22))
-        gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
-        gear.imagePosition = .imageOnly
-        gear.isBordered = false
-        gear.contentTintColor = .secondaryLabelColor
-        gear.toolTip = "Ajustes"
-        gear.setAccessibilityLabel("Ajustes")
-        gear.target = self
-        gear.action = #selector(showSettings(_:))
-        root.addSubview(gear)
-
-        // Interruptor de IA (relay con Haiku), a la izquierda del engranaje.
-        let ai = NSButton(frame: NSRect(x: W - 68, y: 10, width: 28, height: 22))
-        ai.attributedTitle = NSAttributedString(string: "IA", attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .bold)])
-        ai.isBordered = false
+        let bx = pad + iw - 8 - btnW
+        let by = y + 8 + (23 - 22) / 2
+        let ai = HoverButton(frame: NSRect(x: bx, y: by, width: 22, height: 22))
         let hasClaude = claudeBinary() != nil
+        let aiColor: NSColor = !hasClaude || !aiEnabled ? Pal.muted.withAlphaComponent(0.5)
+            : (aiLoginFailed ? .systemYellow : Pal.foreground)
+        ai.attributedTitle = NSAttributedString(string: "IA", attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .bold), .foregroundColor: aiColor])
+        ai.isBordered = false
+        ai.wantsLayer = true
+        ai.layer?.cornerRadius = 5
         ai.isEnabled = hasClaude
-        ai.contentTintColor = !hasClaude || !aiEnabled ? .tertiaryLabelColor : (aiLoginFailed ? .systemYellow : .labelColor)
         ai.toolTip = !hasClaude ? "Claude Code no está instalado"
             : (notice ? Config.loginText : "IA: avisar a la sesión de Claude dueña (enlace con Haiku)")
         ai.setAccessibilityLabel("IA: avisar a la sesión de Claude dueña (enlace con Haiku)")
         ai.target = self
         ai.action = #selector(toggleAI(_:))
         root.addSubview(ai)
+        let gear = HoverButton(frame: NSRect(x: bx + 24, y: by, width: 22, height: 22))
+        gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
+        gear.imagePosition = .imageOnly
+        gear.isBordered = false
+        gear.wantsLayer = true
+        gear.layer?.cornerRadius = 5
+        gear.contentTintColor = Pal.muted
+        gear.toolTip = "Ajustes"
+        gear.setAccessibilityLabel("Ajustes")
+        gear.target = self
+        gear.action = #selector(showSettings(_:))
+        root.addSubview(gear)
+        y += 8 + 23 + 10 + 2
+
         if notice {
-            let l = panelLabel(Config.loginText, size: 11, frame: NSRect(x: 16, y: H - 22, width: W - 32, height: 16))
+            let l = NSTextField(wrappingLabelWithString: Config.loginText)
+            l.font = NSFont.systemFont(ofSize: 11)
             l.textColor = .systemYellow
+            l.frame = NSRect(x: pad + 8, y: y, width: iw - 16, height: 30)
             root.addSubview(l)
+            y += 30 + 2
         }
 
+        func divider(topMargin: CGFloat) {
+            y += topMargin
+            let d = NSView(frame: NSRect(x: pad + 8, y: y, width: iw - 16, height: 0.5))
+            d.wantsLayer = true
+            d.layer?.backgroundColor = Pal.border.cgColor
+            root.addSubview(d)
+            y += 0.5 + 2
+        }
+        func section(_ title: String, total: String? = nil) {
+            root.addSubview(panelLabel(title, size: 11, weight: .semibold, color: Pal.muted,
+                                       frame: NSRect(x: pad + 8, y: y + 8, width: iw - 16 - 80, height: 14)))
+            if let total {
+                root.addSubview(panelLabel(total, size: 11, mono: true, color: Pal.muted, align: .right,
+                                           frame: NSRect(x: pad + iw - 8 - 80, y: y + 8, width: 80, height: 14)))
+            }
+            y += 8 + 14 + 4 + 2
+        }
+
+        rowTargets = []
+        func addRow(_ text: String, _ bytes: UInt64, _ cpu: Double, _ color: RowColor, _ t: KillTarget, tip: String) {
+            var tag: Int?
+            if !t.pids.isEmpty, !t.pids.contains(getpid()) {   // nunca ofrece cerrar a Guachiman
+                rowTargets.append(t)
+                tag = rowTargets.count - 1
+            }
+            let r = PanelRow(width: iw, text: text, memory: formatBytes(bytes), cpu: "\(Int(cpu.rounded()))%",
+                             color: nsColor(color), stopTag: tag, stopLabel: "Cerrar \(t.name)", stopTip: tip,
+                             target: self, action: #selector(stopClicked(_:)))
+            r.frame.origin = NSPoint(x: pad, y: y)
+            root.addSubview(r)
+            y += rowH
+        }
+
+        divider(topMargin: 0)
+        section("Sesiones de Claude", total: sessions.isEmpty ? nil : formatBytes(sessions.reduce(0) { $0 + $1.bytes }))
+        if sessions.isEmpty {
+            root.addSubview(panelLabel("Sin sesiones de Claude", size: 12.5, color: Pal.muted,
+                                       frame: NSRect(x: pad + 8, y: y + 4, width: iw - 16, height: 16)))
+            y += rowH
+        }
+        for s in sessions {
+            let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
+                             idleFor: lastIdle["session:\(s.pid)"] ?? 0)
+            let title = sessionTitle(pid: s.pid).map(truncatedTitle)
+            addRow(title ?? s.label, s.bytes, s.cpu, c,
+                   KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false),
+                   tip: "Detener")
+        }
+
+        divider(topMargin: 2)
+        section("Apps que más consumen")
+        for a in apps {
+            let c = rowColor(bytes: a.bytes, cpu: a.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
+                             idleFor: lastIdle[a.key] ?? 0)
+            let single = a.key.hasPrefix("pid:")
+            addRow(a.name, a.bytes, a.cpu, c,
+                   KillTarget(name: a.name, bytes: a.bytes, pids: a.pids, appPath: single ? nil : a.key, expandTree: single),
+                   tip: "Cerrar app")
+        }
+        if !orphans.isEmpty {
+            divider(topMargin: 2)
+            section("Huérfanos")
+            for o in orphans {
+                let c = rowColor(bytes: o.bytes, cpu: o.cpu, ramLimit: Config.orphanBytes, cpuLimit: nil,
+                                 idleFor: lastIdle["orphan:\(o.pid)"] ?? 0)
+                addRow(o.name, o.bytes, o.cpu, c,
+                       KillTarget(name: o.name, bytes: o.bytes, pids: o.tree, appPath: nil, expandTree: false),
+                       tip: "Detener")
+            }
+        }
+
+        let H = y + 4 + pad
+        root.frame.size = NSSize(width: W, height: H)
         p.contentView = root
         // Centrado bajo el ícono y recortado a la zona visible de la pantalla.
         if let button = statusItem.button, let win = button.window {

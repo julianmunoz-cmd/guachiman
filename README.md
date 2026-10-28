@@ -31,7 +31,7 @@ Cada fila del menú (sesiones de Claude, huérfanos y las 5 apps que más consum
 - **Amarillo**: al menos el 75 % de alguno de esos umbrales.
 - **Verde**: el resto.
 
-Al borde derecho de cada fila hay un ícono de detener (no aparece en Guachiman). Al pulsarlo se abre una confirmación con el nombre, la RAM y los pids: "¿Cerrar …?". Si confirmas:
+Al pasar el cursor sobre una fila, el botón de detener (un cuadrado rojo) reemplaza al porcentaje de CPU; no aparece en Guachiman. Al pulsarlo se abre una confirmación con el nombre, la RAM y los pids: "¿Cerrar …?". Si confirmas:
 
 - Una app (`.app`) se cierra como con Cmd-Q (`terminate()`); si no se encuentra la app en ejecución, se envía SIGTERM a sus procesos.
 - Sesiones de Claude, huérfanos y procesos sueltos reciben SIGTERM en todo su árbol, hijos primero.
@@ -126,6 +126,15 @@ El ícono se atenúa sin sesiones y se pone rojo mientras haya una alerta activa
    ```sh
    brew services start guachiman
    ```
+
+4. Solo si vas a usar el botón IA: necesitas Claude Code instalado e iniciado sesión, y el directorio del relay debe confiarse una vez:
+
+   ```sh
+   mkdir -p ~/Library/Application\ Support/Guachiman/relay-cwd
+   cd ~/Library/Application\ Support/Guachiman/relay-cwd && claude
+   ```
+
+   Acepta el aviso de confianza, sal con `/exit` y luego enciende IA en el panel. Detalles en [relay/README.md](relay/README.md).
 
 Para detenerlo usa `brew services stop guachiman`; para desinstalarlo, `brew uninstall guachiman`.
 
