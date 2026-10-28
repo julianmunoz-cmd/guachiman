@@ -597,12 +597,12 @@ final class RowView: NSView {
 
         if let stopTag {
             let button = NSButton(frame: NSRect(x: width - 28, y: (height - 16) / 2, width: 16, height: 16))
-            let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
-            button.image = NSImage(systemSymbolName: "stop.circle", accessibilityDescription: "Cerrar")?
+            let cfg = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+            button.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Cerrar")?
                 .withSymbolConfiguration(cfg)
             button.imagePosition = .imageOnly
             button.isBordered = false
-            button.contentTintColor = .secondaryLabelColor
+            button.contentTintColor = .labelColor
             button.toolTip = "Cerrar"
             button.tag = stopTag
             button.target = target
