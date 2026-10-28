@@ -1,3 +1,5 @@
+<p align="center"><img src="icon/app.svg" width="128" alt="Logo de Guachiman"></p>
+
 # Guachiman
 
 App nativa de la barra de menú de macOS (Swift + AppKit, macOS 13+) que vigila la RAM y la CPU de todas tus apps, además de tus sesiones de Claude Code y los procesos huérfanos, y te avisa con notificaciones. Sin ícono en el Dock, sin ventana, sin dependencias.
@@ -7,7 +9,7 @@ App nativa de la barra de menú de macOS (Swift + AppKit, macOS 13+) que vigila 
 - Detecta sesiones de Claude Code (terminal y Claude Desktop): procesos cuyo ejecutable o `argv[0]` se llama exactamente `claude` (las instalaciones de terminal viven en `~/.local/share/claude/versions/<ver>`, así que solo `argv[0]` dice `claude`).
 - Suma la RAM (RSS) de cada sesión y de todos sus procesos hijos, y la etiqueta con el nombre de la carpeta de trabajo.
 - Cada sesión se rotula con su título de Claude Code (el de la pestaña de la terminal; `/rename` manda sobre el automático), leído de forma perezosa solo al abrir el menú, al avisar o en `--once`; sin título muestra la carpeta.
-- Muestra en el menú la memoria libre del sistema y las sesiones ordenadas por consumo. Cada fila (sesiones, huérfanos y las 5 apps) lleva un círculo de color y un botón para detenerla (ver "Colores y detener").
+- Muestra en el menú barras de RAM en uso y CPU con color de calor (verde → amarillo → rojo) y las sesiones ordenadas por consumo. Cada fila (sesiones, huérfanos y las 5 apps) lleva un círculo de color y un botón para detenerla (ver "Colores y detener").
 - Vigila todas las demás apps: agrupa los procesos por app (el `.app` más externo de la ruta del ejecutable, p. ej. los helpers de Google Chrome cuentan como "Google Chrome"; un proceso fuera de un `.app` es su propio grupo) y suma su RAM y su CPU (% de un núcleo, calculado entre dos sondeos). Los procesos de sesiones de Claude y de huérfanos no se repiten ahí. El menú lista las 5 apps que más RAM usan.
 - Te notifica cuando una sesión, una app o el sistema superan los umbrales. Las apps solo se cierran si tú lo pides con el botón de detener.
 - Lee los procesos con `libproc` y `sysctl`; no lanza `ps`.

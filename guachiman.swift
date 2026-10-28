@@ -1345,7 +1345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Cabecera: dos medidores y los botones IA / ajustes.
         let btnW: CGFloat = 22 * 2 + 2
         let meterW = (iw - 16 - btnW - 24) / 2
-        func meter(_ x: CGFloat, _ label: String, _ value: String, _ fraction: Double, _ fill: NSColor, _ a11y: String) {
+        func meter(_ x: CGFloat, _ label: String, _ value: String, _ fraction: Double, _ a11y: String) {
             root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 30, height: 14)))
             root.addSubview(panelLabel(value, size: 12, weight: .semibold, mono: true, align: .right,
                                        frame: NSRect(x: x + meterW - 30, y: y + 8, width: 30, height: 14)))
@@ -1356,17 +1356,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             track.setAccessibilityElement(true)
             track.setAccessibilityRole(.image)
             track.setAccessibilityLabel(a11y)
+            // Calor: el degradado ocupa todo el ancho y la barra solo deja ver hasta el uso actual.
             let bar = NSView(frame: NSRect(x: 0, y: 0, width: meterW * CGFloat(max(0, min(1, fraction))), height: 4))
             bar.wantsLayer = true
-            bar.layer?.backgroundColor = fill.cgColor
             bar.layer?.cornerRadius = 2
+            bar.layer?.masksToBounds = true
+            let heat = CAGradientLayer()
+            heat.frame = CGRect(x: 0, y: 0, width: meterW, height: 4)
+            heat.startPoint = CGPoint(x: 0, y: 0.5)
+            heat.endPoint = CGPoint(x: 1, y: 0.5)
+            heat.colors = [Pal.primary.cgColor, NSColor.systemYellow.cgColor, Pal.destructive.cgColor]
+            heat.locations = [0.3, 0.6, 0.85]
+            bar.layer?.addSublayer(heat)
             track.addSubview(bar)
             root.addSubview(track)
         }
-        meter(pad + 8, "RAM libre", "\(snap.freePercent)%", Double(snap.freePercent) / 100,
-              nsColor(freeMemoryColor(freePercent: snap.freePercent)), "RAM libre \(snap.freePercent) %")
+        let usedRAM = 100 - snap.freePercent
+        meter(pad + 8, "RAM", "\(usedRAM)%", Double(usedRAM) / 100, "RAM en uso \(usedRAM) %")
         meter(pad + 8 + meterW + 12, "CPU", cpuTotal.map { "\(Int($0.rounded()))%" } ?? "—", (cpuTotal ?? 0) / 100,
-              Pal.primary, cpuTotal.map { "CPU \(Int($0.rounded())) %" } ?? "CPU no disponible")
+              cpuTotal.map { "CPU \(Int($0.rounded())) %" } ?? "CPU no disponible")
 
         let bx = pad + iw - 8 - btnW
         let by = y + 8 + (23 - 22) / 2
