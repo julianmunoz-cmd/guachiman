@@ -3,7 +3,7 @@ BIN := $(APP)/Contents/MacOS/Guachiman
 ICONS := icon/AppIcon.icns icon/MenuBarIcon.png icon/MenuBarIcon@2x.png
 ICONSET := build/AppIcon.iconset
 
-.PHONY: all run check test notify-test icon clean
+.PHONY: all run check test notify-test icon release clean
 
 all: $(BIN)
 
@@ -36,6 +36,11 @@ test: all
 
 notify-test: all
 	open $(APP) --args --notify-test
+
+# Publica una versión: make release VERSION=x.y.z (DRY_RUN=1 para ensayar).
+release:
+	@[ -n "$(VERSION)" ] || { echo "Uso: make release VERSION=x.y.z [DRY_RUN=1]" >&2; exit 1; }
+	@scripts/release.sh "$(VERSION)"
 
 clean:
 	rm -rf build

@@ -40,6 +40,7 @@ make run      # compila y abre la app
 make check    # ejecuta --once
 make test     # ejecuta --selftest
 make notify-test  # compila, abre la app y envía una notificación de prueba
+make release VERSION=x.y.z  # publica una versión (ver "Publicar una versión")
 make icon     # regenera icon/AppIcon.icns y los PNG de la barra desde icon/*.svg
 make clean
 ```
@@ -68,16 +69,99 @@ El ícono se atenúa sin sesiones y se pone rojo mientras haya una alerta activa
 
 ## Instalación con Homebrew
 
-```sh
-brew install xklbr/tap/guachiman
-brew services start guachiman
-```
+1. Confía en el tap (desde Homebrew 7 los taps de terceros lo requieren antes de instalar):
 
-`brew services start` lo inicia ahora y cada vez que inicies sesión. Para detenerlo, usa `brew services stop guachiman`.
+   ```sh
+   brew trust xklbr/tap
+   ```
+
+2. Instala:
+
+   ```sh
+   brew install xklbr/tap/guachiman
+   ```
+
+3. Inícialo ahora y en cada inicio de sesión:
+
+   ```sh
+   brew services start guachiman
+   ```
+
+Para detenerlo usa `brew services stop guachiman`; para desinstalarlo, `brew uninstall guachiman`.
 
 Se compila desde el código fuente, así que necesitas las Command Line Tools (`xcode-select --install`). No hace falta Xcode completo.
 
-Desde la terminal también puedes ejecutar `guachiman --once` para ver un diagnóstico.
+Desde la terminal puedes ejecutar `guachiman --once` para ver un diagnóstico.
+
+Para actualizar a la última versión:
+
+```sh
+brew update && brew upgrade guachiman
+```
+
+Si tenías abierta una copia desde `build/`, ciérrala antes: la app es de instancia única y la segunda no arranca.
+
+## Publicar una versión
+
+Para quien mantiene el proyecto. No hay cuenta ni registro en Homebrew: el tap es simplemente el repositorio público [xklbr/homebrew-tap](https://github.com/xklbr/homebrew-tap), cuya fórmula `Formula/guachiman.rb` apunta al tarball del tag `vX.Y.Z` de este repo y a su `sha256`.
+
+Requisitos:
+
+- Permiso de `git push` (y `gh` autenticado, si lo usas) en `xklbr/guachiman` y `xklbr/homebrew-tap`.
+- El tap clonado como carpeta hermana: `../homebrew-tap` (o define `TAP_DIR`).
+- Command Line Tools.
+- Ambos repos limpios, en `main` y al día con `origin`.
+
+Primero ensaya y luego publica:
+
+```sh
+DRY_RUN=1 make release VERSION=x.y.z   # valida e imprime los comandos, sin cambiar nada
+make release VERSION=x.y.z
+```
+
+`scripts/release.sh` hace, en orden:
+
+1. Valida la versión (`x.y.z`), que el tag no exista (local ni en origin), que ambos repos estén limpios, en `main` y al día.
+2. Pone `CFBundleShortVersionString` en la versión y suma 1 a `CFBundleVersion` en `Info.plist`.
+3. Ejecuta `make test`.
+4. Hace commit `chore: versión x.y.z`, crea el tag anotado `vx.y.z` y sube `main` y el tag.
+5. Descarga el tarball del tag (con reintentos) y calcula su `sha256`.
+6. Actualiza `url` y `sha256` de la fórmula, hace commit `feat: guachiman x.y.z` en el tap y lo sube.
+
+### A mano
+
+Si el script falla a medias o prefieres hacerlo manualmente:
+
+```sh
+# En guachiman: edita Info.plist (versión y CFBundleVersion), luego
+make test
+git commit -am "chore: versión x.y.z"
+git tag -a vx.y.z -m "Guachiman x.y.z"
+git push origin main vx.y.z
+
+# Calcula el sha256 del tarball
+curl -fsSL https://github.com/xklbr/guachiman/archive/refs/tags/vx.y.z.tar.gz | shasum -a 256
+
+# En homebrew-tap: actualiza url y sha256 en Formula/guachiman.rb
+git commit -am "feat: guachiman x.y.z"
+git push origin main
+```
+
+### Verificar
+
+```sh
+brew update
+brew upgrade guachiman
+brew test xklbr/tap/guachiman
+brew audit --strict --formula xklbr/tap/guachiman
+```
+
+### ¿Y homebrew-core o homebrew-cask?
+
+- **homebrew-core** exige que el proyecto sea notable (alrededor de 75 estrellas, o 30 forks/watchers) y no acepta apps con interfaz gráfica.
+- **homebrew-cask** exige firma de Apple y notarización (Apple Developer Program, USD 99 al año).
+
+Por eso se eligió el tap propio.
 
 ## Licencia
 
