@@ -1019,11 +1019,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forName: Notification.Name(showPanelNotification), object: nil, queue: .main) { [weak self] _ in
             self?.openPanel()
         }
+        // Aviso único tras una actualización: compara con la versión de la ejecución anterior.
+        var updatedNote: String?
+        if let cur = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+            let key = "lastVersion"
+            if let prev = UserDefaults.standard.string(forKey: key), prev != cur {
+                updatedNote = "Guachiman actualizado a \(cur)"
+            }
+            UserDefaults.standard.set(cur, forKey: key)
+        }
         cpuTicksPrev = cpuTicks()   // base para que el primer sondeo ya muestre CPU total
         let wantsTest = CommandLine.arguments.contains("--notify-test")
         notifier.start { [weak self] in
             guard let self else { return }
             if wantsTest { self.notifier.send("Prueba: Guachiman puede notificarte") }
+            if let note = updatedNote { self.notifier.send(note) }
             self.poll()
         }
     }
@@ -1521,12 +1531,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+        let updateItem = NSMenuItem(title: "Actualizar…", action: #selector(runUpdate), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isEnabled = !updating
+        menu.addItem(updateItem)
+        let uninstallItem = NSMenuItem(title: "Desinstalar…", action: #selector(confirmUninstall), keyEquivalent: "")
+        uninstallItem.target = self
+        menu.addItem(uninstallItem)
         let quitItem = NSMenuItem(title: "Salir", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
         menuOpen = true
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
         menuOpen = false
+    }
+
+    private var updating = false
+
+    @objc private func runUpdate() {
+        guard !updating, let script = Bundle.main.resourcePath.map({ $0 + "/update.sh" }),
+              FileManager.default.fileExists(atPath: script) else { return }
+        updating = true
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = [script]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        p.standardInput = FileHandle.nullDevice
+        p.terminationHandler = { [weak self] proc in
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let last = out.split(separator: "\n").last.map(String.init) ?? "No se pudo actualizar"
+            let status = proc.terminationStatus
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updating = false
+                if status == 0 { return }
+                let alert = NSAlert()
+                if status == 10 {
+                    let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+                    alert.messageText = "Ya tienes la última versión (\(v))"
+                } else {
+                    alert.messageText = last
+                }
+                alert.addButton(withTitle: "OK")
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
+        guard (try? p.run()) != nil else { updating = false; return }
+    }
+
+    @objc private func confirmUninstall() {
+        closePanel()
+        DispatchQueue.main.async { [weak self] in self?.runUninstall() }
+    }
+
+    private func runUninstall() {
+        let alert = NSAlert()
+        alert.messageText = "¿Desinstalar Guachiman?"
+        alert.informativeText = "Se quitarán la app, la instalación de Homebrew, la copia en ~/Applications, los ajustes y los datos. Esta acción no se puede deshacer."
+        alert.alertStyle = .warning
+        let go = alert.addButton(withTitle: "Desinstalar")
+        if #available(macOS 11.0, *) { go.hasDestructiveAction = true }
+        alert.addButton(withTitle: "Cancelar")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let script = Bundle.main.resourcePath.map({ $0 + "/uninstall.sh" }),
+              FileManager.default.fileExists(atPath: script) else { return }
+        // Desacoplado en su propia sesión (setsid vía perl) para que launchd no lo mate al detener el servicio.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        p.arguments = ["-e", "use POSIX; POSIX::setsid(); exec @ARGV", "/bin/bash", script]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return }
+        exit(0)
     }
 
     @objc private func stopClicked(_ sender: NSButton) {
@@ -1620,6 +1701,34 @@ func installCopyInApplications() {
 if CommandLine.arguments.contains("--once") {
     runOnce()
     exit(0)
+}
+
+if CommandLine.arguments.contains("--uninstall") {
+    guard let script = Bundle.main.resourcePath.map({ $0 + "/uninstall.sh" }),
+          FileManager.default.fileExists(atPath: script) else {
+        FileHandle.standardError.write(Data("guachiman: no se encontró uninstall.sh en el bundle\n".utf8))
+        exit(1)
+    }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = [script]
+    guard (try? p.run()) != nil else { exit(1) }
+    p.waitUntilExit()
+    exit(p.terminationStatus)
+}
+
+if CommandLine.arguments.contains("--update") {
+    guard let script = Bundle.main.resourcePath.map({ $0 + "/update.sh" }),
+          FileManager.default.fileExists(atPath: script) else {
+        FileHandle.standardError.write(Data("guachiman: no se encontró update.sh en el bundle\n".utf8))
+        exit(1)
+    }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = [script]
+    guard (try? p.run()) != nil else { exit(1) }
+    p.waitUntilExit()
+    exit(p.terminationStatus)
 }
 
 if CommandLine.arguments.contains("--selftest") {

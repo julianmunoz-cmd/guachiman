@@ -46,6 +46,8 @@ Nunca se señalan los pids 0 y 1 ni el propio Guachiman. El menú se construye a
 - **Cerrar huérfanos automáticamente** (apagado por defecto, se recuerda entre ejecuciones): si lo activas, un huérfano de más de 500 MB sostenido por 10 min recibe SIGTERM junto con sus descendientes, tras reverificar que sigue siendo huérfano. No se escala a SIGKILL y se te notifica qué se cerró.
 - **Pausar 1 h**: durante una hora no hay notificaciones ni cierres automáticos; el menú y el ícono siguen actualizándose. Mientras dura aparece "Reanudar (pausado hasta HH:mm)", que cancela la pausa.
 - **Iniciar al encender**: crea o borra `~/Library/LaunchAgents/io.github.guachiman.plist` (surte efecto en el próximo inicio de sesión). "Salir" termina con estado 0, así que no se relanza.
+- **Actualizar…**: ejecuta `brew update` y `brew upgrade guachiman` y reinicia la app si hay una versión nueva; solo funciona con la instalación de Homebrew (equivale a `guachiman --update`).
+- **Desinstalar…**: tras confirmar, borra la app, la instalación de Homebrew, la copia en `~/Applications`, los ajustes y los datos (equivale a `guachiman --uninstall`).
 - Solo se ejecuta una instancia a la vez.
 
 ## Avisos a la sesión de Claude (interruptor "IA")
@@ -144,7 +146,9 @@ Requisitos: macOS 13 o superior, [Homebrew](https://brew.sh) y las Command Line 
 
 La app se copia a `~/Applications` la primera vez que corre, para que aparezca en Spotlight y Launchpad; si la abres desde ahí mientras el servicio está activo, se muestra el panel.
 
-Para detenerlo usa `brew services stop guachiman`; para desinstalarlo, `brew uninstall guachiman` y luego `rm -rf ~/Applications/Guachiman.app`.
+Para detenerlo usa `brew services stop guachiman`.
+
+Para desinstalar todo, ejecuta `guachiman --uninstall` o elige Ajustes (engranaje) > "Desinstalar…". Se quitan la app, la instalación de Homebrew, la copia en `~/Applications`, el inicio automático, los ajustes y los datos. El tap se conserva; si también quieres quitarlo, usa `brew untap xklbr/tap`. El permiso de notificaciones se quita en Ajustes del Sistema > Notificaciones.
 
 Desde la terminal puedes ejecutar `guachiman --once` para ver un diagnóstico.
 
@@ -153,6 +157,8 @@ Para actualizar a la última versión:
 ```sh
 brew update && brew upgrade guachiman
 ```
+
+O bien `guachiman --update`, o Ajustes (engranaje) > "Actualizar…". Al reiniciar con la nueva versión recibes una notificación "Guachiman actualizado a x.y.z".
 
 Si tenías abierta una copia desde `build/`, ciérrala antes: la app es de instancia única y la segunda no arranca.
 

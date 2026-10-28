@@ -7,13 +7,15 @@ ICONSET := build/AppIcon.iconset
 
 all: $(BIN)
 
-$(BIN): guachiman.swift Info.plist $(ICONS) relay/start.sh relay/brief.md
+$(BIN): guachiman.swift Info.plist $(ICONS) relay/start.sh relay/brief.md scripts/uninstall.sh scripts/update.sh
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	swiftc -O -target $$(uname -m)-apple-macos13.0 guachiman.swift -o $(BIN)
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp $(ICONS) $(APP)/Contents/Resources/
 	mkdir -p $(APP)/Contents/Resources/relay
 	cp relay/start.sh relay/brief.md $(APP)/Contents/Resources/relay/
+	cp scripts/uninstall.sh $(APP)/Contents/Resources/uninstall.sh
+	cp scripts/update.sh $(APP)/Contents/Resources/update.sh
 	codesign -s - --force $(APP)
 
 # Regenera los íconos desde icon/*.svg. No forma parte del build normal.
