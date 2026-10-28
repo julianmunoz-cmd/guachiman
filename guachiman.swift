@@ -1,4 +1,5 @@
-// Guachiman — menu bar app que vigila la RAM de las sesiones de Claude Code.
+// Guachiman — menu bar app que vigila la RAM y la CPU de todas las apps, además de
+// las sesiones de Claude Code y los procesos huérfanos.
 // Por defecto es de solo lectura. Solo envía SIGTERM a procesos huérfanos
 // (ppid 1: node, vitest, next, playwright) si el usuario activa "Cerrar huérfanos
 // automáticamente" en el menú (apagado de fábrica); nunca toca sesiones de Claude.
@@ -15,8 +16,9 @@ enum Config {
     static let systemFreeMinPercent = 20         // alerta de sistema: libre < 20%
     static let cooldown: TimeInterval = 600      // enfriamiento por clave: 10 min
     static let regrowthFactor = 1.25             // re-alerta antes si el valor creció > 25%
-    static let pollActive: TimeInterval = 20     // con >= 1 sesión
-    static let pollIdle: TimeInterval = 60       // sin sesiones
+    static let pollActive: TimeInterval = 20     // intervalo de sondeo
+    static let appCpuPercent = 80.0              // alerta de app: > 80% de un núcleo
+    static let appCpuSustained: TimeInterval = 120   // ... sostenido 120 s
     static let sessionExecutable = "claude"
     static let orphanBytes: UInt64 = 500 * 1_048_576  // huérfano: > 500 MB
     static let orphanAlertAfter: TimeInterval = 60    // ... sostenido 60 s para avisar
@@ -43,19 +45,33 @@ enum Orphan {
     }
 }
 
-/// Desde cuándo está cada pid por encima del umbral.
-struct SustainedTracker {
-    private var since: [pid_t: Date] = [:]
+/// Desde cuándo está cada clave (pid, grupo de app...) por encima del umbral.
+struct SustainedTracker<Key: Hashable> {
+    private var since: [Key: Date] = [:]
 
     /// Devuelve cuánto lleva sostenido (0 si no está por encima).
-    mutating func update(_ pid: pid_t, over: Bool, now: Date) -> TimeInterval {
-        guard over else { since[pid] = nil; return 0 }
-        let start = since[pid] ?? now
-        since[pid] = start
+    mutating func update(_ key: Key, over: Bool, now: Date) -> TimeInterval {
+        guard over else { since[key] = nil; return 0 }
+        let start = since[key] ?? now
+        since[key] = start
         return now.timeIntervalSince(start)
     }
 
-    mutating func retain(_ live: Set<pid_t>) { since = since.filter { live.contains($0.key) } }
+    mutating func retain(_ live: Set<Key>) { since = since.filter { live.contains($0.key) } }
+}
+
+/// Grupo de una app: el `.app` más externo del path; sin `.app`, el proceso es su propio grupo (clave con pid).
+func appGroup(path: String?, argv0: String?, pid: pid_t) -> (key: String, name: String) {
+    if let path, let r = path.range(of: ".app/") {
+        return (String(path[..<r.upperBound]), ((String(path[..<r.lowerBound])) as NSString).lastPathComponent)
+    }
+    return ("pid:\(pid)", ((path ?? argv0 ?? "?") as NSString).lastPathComponent)
+}
+
+/// % de un núcleo a partir de dos lecturas de tiempo de CPU en unidades Mach.
+func cpuPercent(prev: UInt64, cur: UInt64, wall: TimeInterval, timebase: (numer: UInt32, denom: UInt32)) -> Double {
+    guard wall > 0, cur >= prev, timebase.denom > 0 else { return 0 }
+    return Double(cur - prev) * Double(timebase.numer) / Double(timebase.denom) / (wall * 1e9) * 100
 }
 
 func pauseActive(until: Date?, now: Date) -> Bool {
@@ -80,7 +96,7 @@ func runSelfTest() {
     precondition(Orphan.name(exe: "/bin/zsh", argv0: "claude") == nil)
     precondition(Orphan.name(exe: nil, argv0: nil) == nil)
 
-    var t = SustainedTracker()
+    var t = SustainedTracker<pid_t>()
     let t0 = Date()
     precondition(t.update(1, over: true, now: t0) == 0)
     precondition(t.update(1, over: true, now: t0 + 61) >= Config.orphanAlertAfter)
@@ -91,6 +107,23 @@ func runSelfTest() {
     _ = t.update(2, over: true, now: t0)
     t.retain([1])
     precondition(t.update(2, over: true, now: t0 + 900) == 0)   // pid muerto olvidado
+
+    var ts = SustainedTracker<String>()
+    _ = ts.update("a", over: true, now: t0)
+    precondition(ts.update("a", over: true, now: t0 + 5) == 5)
+    ts.retain([])
+    precondition(ts.update("a", over: true, now: t0 + 9) == 0)
+
+    let chrome = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)"
+    precondition(appGroup(path: chrome, argv0: nil, pid: 5) == ("/Applications/Google Chrome.app/", "Google Chrome"))
+    precondition(appGroup(path: "/usr/bin/python3", argv0: nil, pid: 7) == ("pid:7", "python3"))
+    precondition(appGroup(path: "/usr/bin/python3", argv0: nil, pid: 8).key != appGroup(path: "/usr/bin/python3", argv0: nil, pid: 7).key)
+    precondition(appGroup(path: nil, argv0: "/opt/x/tool", pid: 9) == ("pid:9", "tool"))
+    precondition(appGroup(path: nil, argv0: nil, pid: 9).name == "?")
+    precondition(cpuPercent(prev: 0, cur: 1_000_000_000, wall: 1, timebase: (1, 1)) == 100)
+    precondition(abs(cpuPercent(prev: 10, cur: 24_000_010, wall: 2, timebase: (125, 3)) - 50) < 0.0001)
+    precondition(cpuPercent(prev: 5, cur: 9, wall: 0, timebase: (1, 1)) == 0)
+    precondition(cpuPercent(prev: 9, cur: 5, wall: 1, timebase: (1, 1)) == 0)
 
     let now = Date()
     precondition(!pauseActive(until: nil, now: now))
@@ -123,9 +156,17 @@ struct OrphanProc {
     let tree: [pid_t]   // el huérfano y todos sus descendientes
 }
 
+struct AppUsage {
+    let key: String
+    let name: String
+    var bytes: UInt64 = 0
+    var cpu = 0.0   // % de un núcleo
+}
+
 struct Snapshot {
     let sessions: [Session]   // ordenadas por RAM desc
     let orphans: [OrphanProc]
+    let apps: [AppUsage]      // resto de procesos agrupados por app, por RAM desc
     let freePercent: Int
 }
 
@@ -184,12 +225,23 @@ func isClaude(_ pid: pid_t) -> Bool {
     return false
 }
 
-func residentSize(_ pid: pid_t) -> UInt64? {
+func taskInfo(_ pid: pid_t) -> proc_taskinfo? {
     var info = proc_taskinfo()
     let size = Int32(MemoryLayout<proc_taskinfo>.size)
     guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, size) == size else { return nil }
-    return info.pti_resident_size
+    return info
 }
+
+func residentSize(_ pid: pid_t) -> UInt64? { taskInfo(pid)?.pti_resident_size }
+
+/// Lecturas previas de CPU (pid → tiempo en unidades Mach) para calcular el delta entre sondeos.
+private var cpuPrev: [pid_t: UInt64] = [:]
+private var cpuPrevAt: Date?
+private let timebase: (numer: UInt32, denom: UInt32) = {
+    var t = mach_timebase_info_data_t()
+    mach_timebase_info(&t)
+    return (t.numer, t.denom)
+}()
 
 func executablePath(_ pid: pid_t) -> String? {
     var buffer = [CChar](repeating: 0, count: 4096)
@@ -265,7 +317,28 @@ func takeSnapshot() -> Snapshot {
                                   bytes: pids.reduce(UInt64(0)) { $0 + (residentSize($1) ?? 0) }, tree: pids))
     }
     orphans.sort { $0.bytes > $1.bytes }
-    return Snapshot(sessions: sessions, orphans: orphans, freePercent: freeMemoryPercent())
+
+    // Apps: todo lo que no es sesión ni huérfano, agrupado por .app. La primera lectura de un pid da CPU 0.
+    let sampledAt = Date()
+    let wall = cpuPrevAt.map { sampledAt.timeIntervalSince($0) } ?? 0
+    let excluded = sessionPids.union(orphans.flatMap { $0.tree })
+    var cpuNow: [pid_t: UInt64] = [:]
+    var groups: [String: AppUsage] = [:]
+    for pid in parents.keys where !excluded.contains(pid) {
+        guard let ti = taskInfo(pid) else { continue }
+        let ticks = ti.pti_total_user + ti.pti_total_system
+        cpuNow[pid] = ticks
+        let path = executablePath(pid)
+        let g = appGroup(path: path, argv0: path == nil ? argv0(pid) : nil, pid: pid)
+        groups[g.key, default: AppUsage(key: g.key, name: g.name)].bytes += ti.pti_resident_size
+        if let prev = cpuPrev[pid] {
+            groups[g.key]!.cpu += cpuPercent(prev: prev, cur: ticks, wall: wall, timebase: timebase)
+        }
+    }
+    cpuPrev = cpuNow
+    cpuPrevAt = sampledAt
+    let apps = groups.values.sorted { $0.bytes > $1.bytes }
+    return Snapshot(sessions: sessions, orphans: orphans, apps: apps, freePercent: freeMemoryPercent())
 }
 
 // MARK: - Formato
@@ -280,6 +353,8 @@ func formatBytes(_ bytes: UInt64) -> String {
 // MARK: - Modo --once
 
 func runOnce() {
+    _ = takeSnapshot()                      // primera lectura de CPU
+    Thread.sleep(forTimeInterval: 1)
     let snap = takeSnapshot()
     let mem = physicalMemory()
     let limit = UInt64(Double(mem) * Config.sessionFraction)
@@ -293,9 +368,13 @@ func runOnce() {
     for o in snap.orphans { print("\(o.pid)\t\(o.name)\t\(o.bytes / 1_048_576)") }
     if snap.orphans.isEmpty { print("(ninguno)") }
     print("")
+    print("Apps (nombre\tMB\tCPU %)")
+    for a in snap.apps.prefix(10) { print("\(a.name)\t\(a.bytes / 1_048_576)\t\(Int(a.cpu.rounded()))") }
+    print("")
     print("Memoria libre: \(snap.freePercent)%")
     print("RAM física: \(mem / 1_048_576) MB")
     print("Umbral de sesión: \(limit / 1_048_576) MB (\(Int(Config.sessionFraction * 100))% de la RAM, sostenido \(Int(Config.sessionSustained)) s)")
+    print("Umbral de app: \(limit / 1_048_576) MB sostenido \(Int(Config.sessionSustained)) s, o \(Int(Config.appCpuPercent)) % de CPU sostenido \(Int(Config.appCpuSustained)) s")
     print("Umbral de sistema: memoria libre < \(Config.systemFreeMinPercent)%")
 }
 
@@ -348,7 +427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let notifier = Notifier()
     private let memory = physicalMemory()
     private var overSince: [pid_t: Date] = [:]
-    private var orphanTracker = SustainedTracker()
+    private var orphanTracker = SustainedTracker<pid_t>()
+    private var appRamTracker = SustainedTracker<String>()
+    private var appCpuTracker = SustainedTracker<String>()
     private var closedAttempted = Set<pid_t>()
     private var pausedUntil: Date?
     private var lastSnap: Snapshot?
@@ -431,9 +512,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 close(o)
             }
         }
+
+        // Apps: RAM > 15% sostenida 60 s, CPU > 80% de un núcleo sostenida 120 s. Solo avisa, nunca cierra.
+        var appOver = false
+        let appKeys = Set(snap.apps.map { $0.key })
+        appRamTracker.retain(appKeys)
+        appCpuTracker.retain(appKeys)
+        for a in snap.apps {
+            if appRamTracker.update(a.key, over: a.bytes > limit, now: now) >= Config.sessionSustained {
+                appOver = true
+                alert(key: "appram:\(a.key)", value: Double(a.bytes),
+                      text: "\(a.name) usa \(formatBytes(a.bytes)) de RAM", now: now)
+            }
+            if appCpuTracker.update(a.key, over: a.cpu > Config.appCpuPercent, now: now) >= Config.appCpuSustained {
+                appOver = true
+                alert(key: "appcpu:\(a.key)", value: a.cpu,
+                      text: "\(a.name) usa \(Int(a.cpu.rounded())) % de CPU sostenido", now: now)
+            }
+        }
         lastAlert = lastAlert.filter { k, _ in
             if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
             if k.hasPrefix("orphan:") { return orphanPids.contains(pid_t(k.dropFirst(7)) ?? -1) }
+            if k.hasPrefix("appram:") || k.hasPrefix("appcpu:") { return appKeys.contains(String(k.dropFirst(7))) }
             return true
         }
 
@@ -444,8 +544,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   text: "Memoria libre baja: \(snap.freePercent)%", now: now)
         }
 
-        updateUI(snap, alerting: anyOver || systemLow || orphanOver)
-        schedule(snap.sessions.isEmpty ? Config.pollIdle : Config.pollActive)
+        updateUI(snap, alerting: anyOver || systemLow || orphanOver || appOver)
+        schedule(Config.pollActive)
     }
 
     /// SIGTERM al huérfano y sus descendientes (hijos primero), tras reverificar con un snapshot nuevo.
@@ -542,6 +642,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         for o in snap.orphans {
             menu.addItem(disabled("Huérfano \(o.name) — \(formatBytes(o.bytes)) (pid \(o.pid))"))
+        }
+        menu.addItem(.separator())
+        menu.addItem(disabled("Apps que más consumen"))
+        for a in snap.apps.prefix(5) {
+            menu.addItem(disabled("\(a.name) — \(formatBytes(a.bytes)) · \(Int(a.cpu.rounded())) % CPU"))
         }
         if !notifier.isAuthorized {
             let item = NSMenuItem(title: "Activar notificaciones…", action: #selector(openNotificationSettings), keyEquivalent: "")
