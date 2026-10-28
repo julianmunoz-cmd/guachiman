@@ -77,5 +77,9 @@ run git -C "$TAP_DIR" commit -m "feat: guachiman $VERSION"
 run git -C "$TAP_DIR" push origin main
 
 echo
+if [ "$DRY_RUN" = 1 ]; then
+  echo "Ensayo terminado: no se publicó nada. Quita DRY_RUN=1 para publicar."
+  exit 0
+fi
 echo "Listo. Guachiman $VERSION publicado. Para actualizar:"
 echo "  brew update && brew upgrade guachiman"
