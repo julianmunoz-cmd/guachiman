@@ -849,13 +849,13 @@ enum Pal {
         NSColor(srgbRed: CGFloat((v >> 16) & 255) / 255, green: CGFloat((v >> 8) & 255) / 255,
                 blue: CGFloat(v & 255) / 255, alpha: 1)
     }
-    static let popover = hex(0x151a18)
-    static let foreground = hex(0xedf2ef)
-    static let muted = hex(0x94a09a)
-    static let accent = hex(0x1e2523)
+    static let popover = hex(0x161616)
+    static let foreground = hex(0xededed)
+    static let muted = hex(0x9a9a9a)
+    static let accent = hex(0x262626)
     static let primary = hex(0x00d495)
     static let destructive = hex(0xe5484d)
-    static let border = hex(0x252c29)
+    static let border = hex(0x2a2a2a)
 }
 
 func panelLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular, mono: Bool = false,
@@ -1341,9 +1341,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let btnW: CGFloat = 22 * 2 + 2
         let meterW = (iw - 16 - btnW - 24) / 2
         func meter(_ x: CGFloat, _ label: String, _ value: String, _ fraction: Double, _ fill: NSColor, _ a11y: String) {
-            root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 44, height: 14)))
+            root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 30, height: 14)))
             root.addSubview(panelLabel(value, size: 12, weight: .semibold, mono: true, align: .right,
-                                       frame: NSRect(x: x + meterW - 48, y: y + 8, width: 48, height: 14)))
+                                       frame: NSRect(x: x + meterW - 30, y: y + 8, width: 30, height: 14)))
             let track = NSView(frame: NSRect(x: x, y: y + 8 + 14 + 5, width: meterW, height: 4))
             track.wantsLayer = true
             track.layer?.backgroundColor = Pal.accent.cgColor
