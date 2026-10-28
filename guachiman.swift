@@ -1014,6 +1014,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         src.setEventHandler { [weak self] in self?.quit() }
         src.resume()
         termSource = src
+        // Otra instancia (p. ej. la copia de ~/Applications abierta desde Spotlight) pide abrir el panel.
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name(showPanelNotification), object: nil, queue: .main) { [weak self] _ in
+            self?.openPanel()
+        }
         cpuTicksPrev = cpuTicks()   // base para que el primer sondeo ya muestre CPU total
         let wantsTest = CommandLine.arguments.contains("--notify-test")
         notifier.start { [weak self] in
@@ -1572,6 +1577,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Copia en ~/Applications
+
+let showPanelNotification = "io.github.guachiman.showPanel"
+
+/// Homebrew deja la app en Cellar, que Spotlight/Launchpad no indexan: se copia a ~/Applications.
+/// Solo reemplaza un bundle propio (mismo identificador) cuya versión difiere; los errores se ignoran.
+func installCopyInApplications() {
+    let fm = FileManager.default
+    let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
+    let target = dir.appendingPathComponent("Guachiman.app")
+    let src = Bundle.main.bundleURL
+    guard src.pathExtension == "app", src.standardizedFileURL.path != target.standardizedFileURL.path else { return }
+    func info(_ url: URL) -> [String: Any]? {
+        NSDictionary(contentsOf: url.appendingPathComponent("Contents/Info.plist")) as? [String: Any]
+    }
+    let mine = Bundle.main.infoDictionary
+    if fm.fileExists(atPath: target.path) {
+        guard let theirs = info(target),
+              theirs["CFBundleIdentifier"] as? String == mine?["CFBundleIdentifier"] as? String else { return }
+        if theirs["CFBundleVersion"] as? String == mine?["CFBundleVersion"] as? String { return }
+    }
+    do {
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        if fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
+        try fm.copyItem(at: src, to: target)
+    } catch {
+        FileHandle.standardError.write(Data("guachiman: no se pudo copiar a ~/Applications: \(error)\n".utf8))
+    }
+}
+
 // MARK: - Main
 
 if CommandLine.arguments.contains("--once") {
@@ -1584,12 +1619,16 @@ if CommandLine.arguments.contains("--selftest") {
     exit(0)
 }
 
-// Instancia única: si ya corre otra app con el mismo bundle id, salir sin error.
+// Instancia única: si ya corre otra app con el mismo bundle id, pedirle que abra su panel y salir.
 if let id = Bundle.main.bundleIdentifier,
    NSRunningApplication.runningApplications(withBundleIdentifier: id)
        .contains(where: { $0.processIdentifier != getpid() }) {
+    DistributedNotificationCenter.default().postNotificationName(
+        Notification.Name(showPanelNotification), object: nil, userInfo: nil, deliverImmediately: true)
     exit(0)
 }
+
+installCopyInApplications()
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)

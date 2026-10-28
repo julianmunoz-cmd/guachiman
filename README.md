@@ -140,7 +140,9 @@ Requisitos: macOS 13 o superior, [Homebrew](https://brew.sh) y las Command Line 
 
    Acepta el aviso de confianza, sal con `/exit` y luego enciende IA en el panel. Detalles en [relay/README.md](relay/README.md).
 
-Para detenerlo usa `brew services stop guachiman`; para desinstalarlo, `brew uninstall guachiman`.
+La app se copia a `~/Applications` la primera vez que corre, para que aparezca en Spotlight y Launchpad; si la abres desde ahí mientras el servicio está activo, se muestra el panel.
+
+Para detenerlo usa `brew services stop guachiman`; para desinstalarlo, `brew uninstall guachiman` y luego `rm -rf ~/Applications/Guachiman.app`.
 
 Desde la terminal puedes ejecutar `guachiman --once` para ver un diagnóstico.
 
