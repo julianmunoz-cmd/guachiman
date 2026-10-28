@@ -1526,16 +1526,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
                             on: FileManager.default.fileExists(atPath: agentURL.path)))
         if !notifier.isAuthorized {
-            let item = NSMenuItem(title: "Activar notificaciones…", action: #selector(openNotificationSettings), keyEquivalent: "")
+            let item = NSMenuItem(title: "Activar notificaciones", action: #selector(openNotificationSettings), keyEquivalent: "")
             item.target = self
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        let updateItem = NSMenuItem(title: "Actualizar…", action: #selector(runUpdate), keyEquivalent: "")
+        let updateItem = NSMenuItem(title: "Actualizar", action: #selector(runUpdate), keyEquivalent: "")
         updateItem.target = self
         updateItem.isEnabled = !updating
         menu.addItem(updateItem)
-        let uninstallItem = NSMenuItem(title: "Desinstalar…", action: #selector(confirmUninstall), keyEquivalent: "")
+        let uninstallItem = NSMenuItem(title: "Desinstalar", action: #selector(confirmUninstall), keyEquivalent: "")
         uninstallItem.target = self
         menu.addItem(uninstallItem)
         let quitItem = NSMenuItem(title: "Salir", action: #selector(quit), keyEquivalent: "q")

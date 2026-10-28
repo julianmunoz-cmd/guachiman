@@ -26,6 +26,8 @@ find_relay() {
 if [ "${1:-}" = "stop" ]; then
   read -r pid job < <(find_relay) || { echo "relay no está corriendo"; exit 0; }
   "$CLAUDE" stop "${job:-$pid}" >/dev/null 2>&1
+  # El daemon de Claude Code y su proceso de reserva quedarían vivos (~300 MB); --keep-workers respeta otras sesiones --bg.
+  "$CLAUDE" daemon stop --any --keep-workers >/dev/null 2>&1
   echo "relay detenido (pid $pid)"
   exit 0
 fi
