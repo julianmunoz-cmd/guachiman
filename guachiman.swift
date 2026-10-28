@@ -1,8 +1,8 @@
 // Guachiman — menu bar app que vigila la RAM y la CPU de todas las apps, además de
 // las sesiones de Claude Code y los procesos huérfanos.
-// Por defecto es de solo lectura. Solo envía SIGTERM a procesos huérfanos
-// (ppid 1: node, vitest, next, playwright) si el usuario activa "Cerrar huérfanos
-// automáticamente" en el menú (apagado de fábrica); nunca toca sesiones de Claude.
+// Solo cierra procesos cuando el usuario lo confirma con el botón de detener de cada fila
+// del menú, o con SIGTERM a huérfanos (ppid 1: node, vitest, next, playwright) si activa
+// "Cerrar huérfanos automáticamente" (apagado de fábrica).
 
 import AppKit
 import Darwin
@@ -23,6 +23,9 @@ enum Config {
     static let orphanBytes: UInt64 = 500 * 1_048_576  // huérfano: > 500 MB
     static let orphanAlertAfter: TimeInterval = 60    // ... sostenido 60 s para avisar
     static let orphanCloseAfter: TimeInterval = 600   // ... sostenido 10 min para cerrar
+    static let idleCpuPercent = 1.0              // fila inactiva: CPU < 1 %
+    static let idleAfter: TimeInterval = 120     // ... de forma continua por 120 s
+    static let warnFraction = 0.75               // amarillo: >= 75 % de un umbral
     static let pauseDuration: TimeInterval = 3600
     static let autoCloseKey = "autoCloseOrphans"
     static let agentLabel = "io.github.guachiman"
@@ -74,6 +77,20 @@ func appGroup(path: String?, argv0: String?, pid: pid_t) -> (key: String, name: 
 func cpuPercent(prev: UInt64, cur: UInt64, wall: TimeInterval, timebase: (numer: UInt32, denom: UInt32)) -> Double {
     guard wall > 0, cur >= prev, timebase.denom > 0 else { return 0 }
     return Double(cur - prev) * Double(timebase.numer) / Double(timebase.denom) / (wall * 1e9) * 100
+}
+
+enum RowColor: String {
+    case green = "verde", yellow = "amarillo", red = "rojo", gray = "gris"
+}
+
+/// Color de una fila. Gris (inactiva) manda sobre el resto; después rojo (sobre el umbral),
+/// amarillo (>= 75 % de algún umbral) y verde. `cpuLimit` nil = sin umbral de CPU (huérfanos).
+func rowColor(bytes: UInt64, cpu: Double, ramLimit: UInt64, cpuLimit: Double?, idleFor: TimeInterval) -> RowColor {
+    if cpu < Config.idleCpuPercent, idleFor >= Config.idleAfter { return .gray }
+    if bytes > ramLimit || (cpuLimit.map { cpu > $0 } ?? false) { return .red }
+    if Double(bytes) >= Config.warnFraction * Double(ramLimit)
+        || (cpuLimit.map { cpu >= Config.warnFraction * $0 } ?? false) { return .yellow }
+    return .green
 }
 
 func pauseActive(until: Date?, now: Date) -> Bool {
@@ -189,6 +206,17 @@ func runSelfTest() {
     precondition(cpuPercent(prev: 5, cur: 9, wall: 0, timebase: (1, 1)) == 0)
     precondition(cpuPercent(prev: 9, cur: 5, wall: 1, timebase: (1, 1)) == 0)
 
+    precondition(rowColor(bytes: 2000, cpu: 0.5, ramLimit: 1000, cpuLimit: 80, idleFor: 120) == .gray)   // gris manda sobre rojo
+    precondition(rowColor(bytes: 2000, cpu: 0.5, ramLimit: 1000, cpuLimit: 80, idleFor: 119) == .red)
+    precondition(rowColor(bytes: 10, cpu: 0, ramLimit: 1000, cpuLimit: 80, idleFor: 60) == .green)       // < 120 s no es gris
+    precondition(rowColor(bytes: 10, cpu: 5, ramLimit: 1000, cpuLimit: 80, idleFor: 500) == .green)      // con CPU >= 1 % no es gris
+    precondition(rowColor(bytes: 1000, cpu: 10, ramLimit: 1000, cpuLimit: 80, idleFor: 0) == .yellow)    // igual al umbral no es rojo
+    precondition(rowColor(bytes: 10, cpu: 81, ramLimit: 1000, cpuLimit: 80, idleFor: 0) == .red)
+    precondition(rowColor(bytes: 750, cpu: 10, ramLimit: 1000, cpuLimit: 80, idleFor: 0) == .yellow)
+    precondition(rowColor(bytes: 749, cpu: 10, ramLimit: 1000, cpuLimit: 80, idleFor: 0) == .green)
+    precondition(rowColor(bytes: 10, cpu: 60, ramLimit: 1000, cpuLimit: 80, idleFor: 0) == .yellow)
+    precondition(rowColor(bytes: 10, cpu: 500, ramLimit: 1000, cpuLimit: nil, idleFor: 0) == .green)    // huérfano: sin umbral de CPU
+
     let now = Date()
     precondition(!pauseActive(until: nil, now: now))
     precondition(pauseActive(until: now + 10, now: now))
@@ -211,6 +239,8 @@ struct Session {
     let label: String
     let cwd: String
     let bytes: UInt64
+    let cpu: Double          // % de un núcleo, suma del árbol
+    let tree: [pid_t]
     var top: TopChild? = nil   // solo si supera el umbral
 }
 
@@ -218,6 +248,7 @@ struct OrphanProc {
     let pid: pid_t
     let name: String
     let bytes: UInt64
+    let cpu: Double
     let tree: [pid_t]   // el huérfano y todos sus descendientes
 }
 
@@ -226,6 +257,7 @@ struct AppUsage {
     let name: String
     var bytes: UInt64 = 0
     var cpu = 0.0   // % de un núcleo
+    var pids: [pid_t] = []
 }
 
 struct Snapshot {
@@ -297,8 +329,6 @@ func taskInfo(_ pid: pid_t) -> proc_taskinfo? {
     return info
 }
 
-func residentSize(_ pid: pid_t) -> UInt64? { taskInfo(pid)?.pti_resident_size }
-
 /// Lecturas previas de CPU (pid → tiempo en unidades Mach) para calcular el delta entre sondeos.
 private var cpuPrev: [pid_t: UInt64] = [:]
 private var cpuPrevAt: Date?
@@ -350,6 +380,18 @@ func takeSnapshot() -> Snapshot {
         return true
     }
 
+    // Una sola lectura de taskinfo por pid da RSS y tiempo de CPU; la primera lectura de un pid da CPU 0.
+    let sampledAt = Date()
+    let wall = cpuPrevAt.map { sampledAt.timeIntervalSince($0) } ?? 0
+    var cpuNow: [pid_t: UInt64] = [:]
+    func read(_ pid: pid_t, cpu: inout Double) -> UInt64? {
+        guard let ti = taskInfo(pid) else { return nil }
+        let ticks = ti.pti_total_user + ti.pti_total_system
+        cpuNow[pid] = ticks
+        if let prev = cpuPrev[pid] { cpu += cpuPercent(prev: prev, cur: ticks, wall: wall, timebase: timebase) }
+        return ti.pti_resident_size
+    }
+
     func tree(_ root: pid_t) -> [pid_t] {
         var out: [pid_t] = []
         var stack = [root]
@@ -368,9 +410,10 @@ func takeSnapshot() -> Snapshot {
         let pids = tree(root)
         sessionPids.formUnion(pids)
         var total: UInt64 = 0
+        var cpu = 0.0
         var best: TopChild?
         for p in pids {
-            let r = residentSize(p) ?? 0
+            let r = read(p, cpu: &cpu) ?? 0
             total += r
             best = largerChild(best, pid: p, bytes: r, root: root)
         }
@@ -380,7 +423,7 @@ func takeSnapshot() -> Snapshot {
             b.cmd = commandName(argv0: argv0(b.pid), exe: executablePath(b.pid))
             best = b
         } else { best = nil }
-        sessions.append(Session(pid: root, label: label, cwd: cwd, bytes: total, top: best))
+        sessions.append(Session(pid: root, label: label, cwd: cwd, bytes: total, cpu: cpu, tree: pids, top: best))
     }
     sessions.sort { $0.bytes > $1.bytes }
 
@@ -390,27 +433,24 @@ func takeSnapshot() -> Snapshot {
         guard let name = Orphan.name(exe: executablePath(pid), argv0: argv0(pid)) else { continue }
         let pids = tree(pid)
         if !sessionPids.isDisjoint(with: pids) { continue }
-        orphans.append(OrphanProc(pid: pid, name: name,
-                                  bytes: pids.reduce(UInt64(0)) { $0 + (residentSize($1) ?? 0) }, tree: pids))
+        var cpu = 0.0
+        var bytes: UInt64 = 0
+        for p in pids { bytes += read(p, cpu: &cpu) ?? 0 }
+        orphans.append(OrphanProc(pid: pid, name: name, bytes: bytes, cpu: cpu, tree: pids))
     }
     orphans.sort { $0.bytes > $1.bytes }
 
-    // Apps: todo lo que no es sesión ni huérfano, agrupado por .app. La primera lectura de un pid da CPU 0.
-    let sampledAt = Date()
-    let wall = cpuPrevAt.map { sampledAt.timeIntervalSince($0) } ?? 0
+    // Apps: todo lo que no es sesión ni huérfano, agrupado por .app.
     let excluded = sessionPids.union(orphans.flatMap { $0.tree })
-    var cpuNow: [pid_t: UInt64] = [:]
     var groups: [String: AppUsage] = [:]
     for pid in parents.keys where !excluded.contains(pid) {
-        guard let ti = taskInfo(pid) else { continue }
-        let ticks = ti.pti_total_user + ti.pti_total_system
-        cpuNow[pid] = ticks
+        var cpu = 0.0
+        guard let rss = read(pid, cpu: &cpu) else { continue }
         let path = executablePath(pid)
         let g = appGroup(path: path, argv0: path == nil ? argv0(pid) : nil, pid: pid)
-        groups[g.key, default: AppUsage(key: g.key, name: g.name)].bytes += ti.pti_resident_size
-        if let prev = cpuPrev[pid] {
-            groups[g.key]!.cpu += cpuPercent(prev: prev, cur: ticks, wall: wall, timebase: timebase)
-        }
+        groups[g.key, default: AppUsage(key: g.key, name: g.name)].bytes += rss
+        groups[g.key]!.cpu += cpu
+        groups[g.key]!.pids.append(pid)
     }
     cpuPrev = cpuNow
     cpuPrevAt = sampledAt
@@ -435,18 +475,24 @@ func runOnce() {
     let snap = takeSnapshot()
     let mem = physicalMemory()
     let limit = UInt64(Double(mem) * Config.sessionFraction)
-    print("PID\tETIQUETA\tTOTAL_MB\tCWD")
+    // Con una sola muestra de 1 s no se puede saber si una fila está inactiva: nunca sale "gris".
+    func status(_ bytes: UInt64, _ cpu: Double, _ ramLimit: UInt64, _ cpuLimit: Double?) -> String {
+        rowColor(bytes: bytes, cpu: cpu, ramLimit: ramLimit, cpuLimit: cpuLimit, idleFor: 0).rawValue
+    }
+    print("PID\tETIQUETA\tTOTAL_MB\tESTADO\tCWD")
     for s in snap.sessions {
-        print("\(s.pid)\t\(s.label)\t\(s.bytes / 1_048_576)\t\(s.cwd)")
+        print("\(s.pid)\t\(s.label)\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(s.cwd)")
     }
     if snap.sessions.isEmpty { print("(sin sesiones de Claude)") }
     print("")
-    print("Candidatos a huérfano (pid\tnombre\tMB)")
-    for o in snap.orphans { print("\(o.pid)\t\(o.name)\t\(o.bytes / 1_048_576)") }
+    print("Candidatos a huérfano (pid\tnombre\tMB\testado)")
+    for o in snap.orphans { print("\(o.pid)\t\(o.name)\t\(o.bytes / 1_048_576)\t\(status(o.bytes, o.cpu, Config.orphanBytes, nil))") }
     if snap.orphans.isEmpty { print("(ninguno)") }
     print("")
-    print("Apps (nombre\tMB\tCPU %)")
-    for a in snap.apps.prefix(10) { print("\(a.name)\t\(a.bytes / 1_048_576)\t\(Int(a.cpu.rounded()))") }
+    print("Apps (nombre\tMB\tCPU %\testado)")
+    for a in snap.apps.prefix(10) {
+        print("\(a.name)\t\(a.bytes / 1_048_576)\t\(Int(a.cpu.rounded()))\t\(status(a.bytes, a.cpu, limit, Config.appCpuPercent))")
+    }
     print("")
     print("Memoria libre: \(snap.freePercent)%")
     print("RAM física: \(mem / 1_048_576) MB")
@@ -499,7 +545,77 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
 // MARK: - Aplicación
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+/// Qué cerrar al pulsar detener en una fila; se captura al construir el menú.
+struct KillTarget {
+    let name: String
+    let bytes: UInt64
+    let pids: [pid_t]        // árbol en preorden (la raíz primero)
+    let appPath: String?     // grupo de una app (.app): se cierra con NSRunningApplication
+    let expandTree: Bool     // proceso suelto: al cerrar se incluyen sus descendientes
+}
+
+/// ¿Es seguro enviarle señales? Nunca pid <= 1 ni Guachiman.
+func signalable(_ pid: pid_t) -> Bool { pid > 1 && pid != getpid() }
+func alive(_ pid: pid_t) -> Bool { signalable(pid) && kill(pid, 0) == 0 }
+
+/// Descendientes de `root` (incluido), en preorden, con una lectura nueva de la tabla de procesos.
+func liveTree(_ root: pid_t) -> [pid_t] {
+    var children: [pid_t: [pid_t]] = [:]
+    for pid in allPids() { if let pp = parentPid(pid) { children[pp, default: []].append(pid) } }
+    var out: [pid_t] = []
+    var stack = [root]
+    var seen = Set<pid_t>()
+    while let pid = stack.popLast() {
+        guard seen.insert(pid).inserted else { continue }
+        out.append(pid)
+        stack.append(contentsOf: children[pid] ?? [])
+    }
+    return out
+}
+
+/// Fila del menú: círculo de estado, nombre y botón de detener (opcional) al borde derecho.
+final class RowView: NSView {
+    init(text: String, color: NSColor, stopTag: Int?, target: AnyObject, action: Selector) {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.menuFont(ofSize: 0)
+        label.sizeToFit()
+        let height: CGFloat = 22
+        let width = 28 + label.frame.width + 12 + 16 + 12
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        autoresizingMask = [.width]
+
+        let dot = NSView(frame: NSRect(x: 14, y: (height - 8) / 2, width: 8, height: 8))
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = color.cgColor
+        dot.layer?.cornerRadius = 4
+        addSubview(dot)
+
+        label.frame.origin = NSPoint(x: 28, y: (height - label.frame.height) / 2)
+        label.autoresizingMask = [.width]
+        label.lineBreakMode = .byTruncatingTail
+        addSubview(label)
+
+        if let stopTag {
+            let button = NSButton(frame: NSRect(x: width - 28, y: (height - 16) / 2, width: 16, height: 16))
+            let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            button.image = NSImage(systemSymbolName: "stop.circle", accessibilityDescription: "Cerrar")?
+                .withSymbolConfiguration(cfg)
+            button.imagePosition = .imageOnly
+            button.isBordered = false
+            button.contentTintColor = .secondaryLabelColor
+            button.toolTip = "Cerrar"
+            button.tag = stopTag
+            button.target = target
+            button.action = action
+            button.autoresizingMask = [.minXMargin]
+            addSubview(button)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let notifier = Notifier()
     private let memory = physicalMemory()
@@ -510,7 +626,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var closedAttempted = Set<pid_t>()
     private var pausedUntil: Date?
     private var lastSnap: Snapshot?
-    private var lastAlerting = false
+    private var idleTracker = SustainedTracker<String>()   // desde cuándo cada fila está con CPU < 1 %
+    private var lastIdle: [String: TimeInterval] = [:]
+    private var rowTargets: [KillTarget] = []
+    private let menu = NSMenu()
     private let agentURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents/\(Config.agentLabel).plist")
     private var autoClose: Bool {
@@ -521,6 +640,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        menu.autoenablesItems = false
+        menu.delegate = self
+        statusItem.menu = menu
         // Pendientes de una ejecución anterior ya no valen (y harían lento al hook): se vuelve a avisar si sigue el problema.
         try? FileManager.default.removeItem(atPath: Config.pendingDir)
         let wantsTest = CommandLine.arguments.contains("--notify-test")
@@ -553,6 +675,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let snap = takeSnapshot()
         let now = Date()
         let limit = UInt64(Double(memory) * Config.sessionFraction)
+
+        // Inactividad: desde cuándo cada fila lleva con CPU < 1 % (y se olvidan las que desaparecen).
+        var idle: [String: TimeInterval] = [:]
+        func track(_ key: String, _ cpu: Double) {
+            idle[key] = idleTracker.update(key, over: cpu < Config.idleCpuPercent, now: now)
+        }
+        for s in snap.sessions { track("session:\(s.pid)", s.cpu) }
+        for o in snap.orphans { track("orphan:\(o.pid)", o.cpu) }
+        for a in snap.apps { track(a.key, a.cpu) }
+        idleTracker.retain(Set(idle.keys))
+        lastIdle = idle
 
         // Sesiones por encima del umbral.
         var anyOver = false
@@ -656,11 +789,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    @objc private func toggleAutoClose() { autoClose.toggle(); refreshMenu() }
+    @objc private func toggleAutoClose() { autoClose.toggle() }
 
     @objc private func togglePause() {
         pausedUntil = pauseActive(until: pausedUntil, now: Date()) ? nil : Date().addingTimeInterval(Config.pauseDuration)
-        refreshMenu()
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -672,12 +804,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try? data.write(to: agentURL)
             }
         }
-        refreshMenu()
     }
 
     @objc private func quit() { exit(0) }   // status 0: KeepAlive { SuccessfulExit = false } no relanza
-
-    private func refreshMenu() { if let s = lastSnap { updateUI(s, alerting: lastAlerting) } }
 
     private func toggle(_ title: String, _ action: Selector, on: Bool) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -688,7 +817,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateUI(_ snap: Snapshot, alerting: Bool) {
         lastSnap = snap
-        lastAlerting = alerting
         if let button = statusItem.button {
             // Ícono propio de 18 pt de alto; si no está en el bundle, usa el SF Symbol.
             let base: NSImage?
@@ -719,24 +847,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 button.alphaValue = snap.sessions.isEmpty ? 0.4 : 1
             }
         }
+    }
 
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        menu.addItem(disabled("Memoria libre: \(snap.freePercent)%"))
-        if snap.sessions.isEmpty {
-            menu.addItem(disabled("Sin sesiones de Claude"))
-        } else {
-            for s in snap.sessions {
-                menu.addItem(disabled("\(s.label) — \(formatBytes(s.bytes)) (pid \(s.pid))"))
+    // MARK: Menú (se construye al abrirlo, a partir del último snapshot)
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        rowTargets = []
+        let limit = UInt64(Double(memory) * Config.sessionFraction)
+        if let snap = lastSnap {
+            menu.addItem(disabled("Memoria libre: \(snap.freePercent)%"))
+            if snap.sessions.isEmpty {
+                menu.addItem(disabled("Sin sesiones de Claude"))
             }
-        }
-        for o in snap.orphans {
-            menu.addItem(disabled("Huérfano \(o.name) — \(formatBytes(o.bytes)) (pid \(o.pid))"))
-        }
-        menu.addItem(.separator())
-        menu.addItem(disabled("Apps que más consumen"))
-        for a in snap.apps.prefix(5) {
-            menu.addItem(disabled("\(a.name) — \(formatBytes(a.bytes)) · \(Int(a.cpu.rounded())) % CPU"))
+            for s in snap.sessions {
+                let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
+                                 idleFor: lastIdle["session:\(s.pid)"] ?? 0)
+                menu.addItem(row("\(s.label) — \(formatBytes(s.bytes)) (pid \(s.pid))", c,
+                                 KillTarget(name: "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false)))
+            }
+            for o in snap.orphans {
+                let c = rowColor(bytes: o.bytes, cpu: o.cpu, ramLimit: Config.orphanBytes, cpuLimit: nil,
+                                 idleFor: lastIdle["orphan:\(o.pid)"] ?? 0)
+                menu.addItem(row("Huérfano \(o.name) — \(formatBytes(o.bytes)) (pid \(o.pid))", c,
+                                 KillTarget(name: o.name, bytes: o.bytes, pids: o.tree, appPath: nil, expandTree: false)))
+            }
+            menu.addItem(.separator())
+            menu.addItem(disabled("Apps que más consumen"))
+            for a in snap.apps.prefix(5) {
+                let c = rowColor(bytes: a.bytes, cpu: a.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
+                                 idleFor: lastIdle[a.key] ?? 0)
+                let single = a.key.hasPrefix("pid:")
+                menu.addItem(row("\(a.name) — \(formatBytes(a.bytes)) · \(Int(a.cpu.rounded())) % CPU", c,
+                                 KillTarget(name: a.name, bytes: a.bytes, pids: a.pids, appPath: single ? nil : a.key, expandTree: single)))
+            }
         }
         if !notifier.isAuthorized {
             let item = NSMenuItem(title: "Activar notificaciones…", action: #selector(openNotificationSettings), keyEquivalent: "")
@@ -760,7 +904,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quitItem = NSMenuItem(title: "Salir", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
-        statusItem.menu = menu
+    }
+
+    /// Suelta las vistas de las filas al cerrar el menú (los ítems normales se quedan).
+    func menuDidClose(_ menu: NSMenu) {
+        for item in menu.items where item.view != nil { item.view = nil }
+        rowTargets = []
+    }
+
+    private func row(_ text: String, _ color: RowColor, _ target: KillTarget) -> NSMenuItem {
+        let ns: NSColor
+        switch color {
+        case .green: ns = .systemGreen
+        case .yellow: ns = .systemYellow
+        case .red: ns = .systemRed
+        case .gray: ns = .systemGray
+        }
+        var tag: Int?
+        if !target.pids.isEmpty, !target.pids.contains(getpid()) {   // nunca ofrece cerrar a Guachiman
+            rowTargets.append(target)
+            tag = rowTargets.count - 1
+        }
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.view = RowView(text: text, color: ns, stopTag: tag, target: self, action: #selector(stopClicked(_:)))
+        return item
+    }
+
+    @objc private func stopClicked(_ sender: NSButton) {
+        guard rowTargets.indices.contains(sender.tag) else { return }
+        let t = rowTargets[sender.tag]
+        statusItem.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in self?.confirmClose(t) }
+    }
+
+    private func confirmClose(_ t: KillTarget) {
+        let live = t.pids.filter(alive)
+        guard !live.isEmpty else { return }
+        let shown = live.prefix(6).map(String.init).joined(separator: ", ")
+        let pidText = (live.count == 1 ? "pid " : "pids ") + shown + (live.count > 6 ? " y \(live.count - 6) más" : "")
+        let alert = NSAlert()
+        alert.messageText = "¿Cerrar \(t.name)?"
+        alert.informativeText = "\(formatBytes(t.bytes)) · \(pidText)"
+        alert.addButton(withTitle: "Cerrar")
+        alert.addButton(withTitle: "Cancelar")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        terminate(t)
+    }
+
+    private func terminate(_ t: KillTarget) {
+        var apps: [NSRunningApplication] = []
+        if let path = t.appPath {
+            let want = path.hasSuffix("/") ? String(path.dropLast()) : path
+            apps = NSWorkspace.shared.runningApplications.filter { $0.bundleURL?.path == want }
+        }
+        let targets: [pid_t]   // en el orden en que se señalan (hijos primero)
+        if !apps.isEmpty {
+            apps.forEach { $0.terminate() }
+            targets = apps.map { $0.processIdentifier }
+        } else {
+            let tree = t.expandTree ? t.pids.flatMap { liveTree($0) } : t.pids
+            targets = t.appPath == nil ? tree.reversed() : tree
+            for pid in targets where alive(pid) { kill(pid, SIGTERM) }
+        }
+        let closing = apps
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            let left = targets.filter(alive)
+            guard !left.isEmpty else { return }
+            let alert = NSAlert()
+            alert.messageText = "\(t.name) sigue abierto. ¿Forzar cierre?"
+            alert.addButton(withTitle: "Forzar")
+            alert.addButton(withTitle: "Cancelar")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            if !closing.isEmpty {
+                closing.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
+            } else {
+                for pid in left where alive(pid) { kill(pid, SIGKILL) }
+            }
+        }
     }
 
     private func disabled(_ title: String) -> NSMenuItem {

@@ -6,9 +6,9 @@ App nativa de la barra de menú de macOS (Swift + AppKit, macOS 13+) que vigila 
 
 - Detecta sesiones de Claude Code (terminal y Claude Desktop): procesos cuyo ejecutable o `argv[0]` se llama exactamente `claude` (las instalaciones de terminal viven en `~/.local/share/claude/versions/<ver>`, así que solo `argv[0]` dice `claude`).
 - Suma la RAM (RSS) de cada sesión y de todos sus procesos hijos, y la etiqueta con el nombre de la carpeta de trabajo.
-- Muestra en el menú la memoria libre del sistema y las sesiones ordenadas por consumo.
+- Muestra en el menú la memoria libre del sistema y las sesiones ordenadas por consumo. Cada fila (sesiones, huérfanos y las 5 apps) lleva un círculo de color y un botón para detenerla (ver "Colores y detener").
 - Vigila todas las demás apps: agrupa los procesos por app (el `.app` más externo de la ruta del ejecutable, p. ej. los helpers de Google Chrome cuentan como "Google Chrome"; un proceso fuera de un `.app` es su propio grupo) y suma su RAM y su CPU (% de un núcleo, calculado entre dos sondeos). Los procesos de sesiones de Claude y de huérfanos no se repiten ahí. El menú lista las 5 apps que más RAM usan.
-- Te notifica cuando una sesión, una app o el sistema superan los umbrales. Las apps solo se vigilan: nunca se les envían señales.
+- Te notifica cuando una sesión, una app o el sistema superan los umbrales. Las apps solo se cierran si tú lo pides con el botón de detener.
 - Lee los procesos con `libproc` y `sysctl`; no lanza `ps`.
 
 ## Notificaciones
@@ -20,6 +20,23 @@ Para comprobar que funcionan, ejecuta `make notify-test`: abre la app con `--not
 ## Huérfanos
 
 Un candidato a huérfano es un proceso con `ppid == 1` cuyo nombre (del ejecutable o de `argv[0]`, también con sufijo tras guion, como `next-server`) es `node`, `vitest`, `next` o `playwright`, y que no pertenece a ninguna sesión de Claude. Su RAM suma la del proceso y la de todos sus descendientes. Se avisa cuando supera 500 MB de forma sostenida por 60 s, con el mismo enfriamiento que el resto de alertas. `--once` también los lista.
+
+## Colores y detener
+
+Cada fila del menú (sesiones de Claude, huérfanos y las 5 apps que más consumen) empieza con un círculo de color. La CPU de sesiones y huérfanos es la suma de su árbol de procesos, como en las apps. Los valores son instantáneos, salvo el gris:
+
+- **Gris**: inactivo; CPU por debajo de 1 % de forma continua durante los últimos 120 s. Una fila vista hace menos de 120 s no es gris. El gris manda sobre los demás colores, también si usa mucha RAM.
+- **Rojo**: supera un umbral (RAM sobre el 15% de la RAM física, o CPU sobre 80% de un núcleo; en huérfanos, RAM sobre 500 MB).
+- **Amarillo**: al menos el 75 % de alguno de esos umbrales.
+- **Verde**: el resto.
+
+Al borde derecho de cada fila hay un ícono de detener (no aparece en Guachiman). Al pulsarlo se abre una confirmación con el nombre, la RAM y los pids: "¿Cerrar …?". Si confirmas:
+
+- Una app (`.app`) se cierra como con Cmd-Q (`terminate()`); si no se encuentra la app en ejecución, se envía SIGTERM a sus procesos.
+- Sesiones de Claude, huérfanos y procesos sueltos reciben SIGTERM en todo su árbol, hijos primero.
+- A los 5 s, si algo sigue vivo, se pregunta "¿Forzar cierre?": `forceTerminate()` para apps y SIGKILL para el resto.
+
+Nunca se señalan los pids 0 y 1 ni el propio Guachiman. El menú se construye al abrirlo, a partir del último sondeo, y no se reconstruye en cada sondeo.
 
 ## Menú
 
@@ -49,7 +66,7 @@ Diseño eficiente: Guachiman no suma timers, hilos ni watchers; el hijo mayor sa
 
 ## Qué no hace
 
-Por defecto es de solo lectura: no envía señales a ningún proceso. Solo cierra huérfanos si tú activas "Cerrar huérfanos automáticamente", y nunca toca sesiones de Claude.
+Solo cierra lo que tú confirmas con el botón de detener de cada fila, o los huérfanos si activas "Cerrar huérfanos automáticamente" (apagado por defecto). Nunca cierra nada por su cuenta salvo esa opción, ni cierra sesiones de Claude sin tu confirmación.
 
 ## Compilar y correr
 
@@ -72,7 +89,7 @@ Necesitas las herramientas de línea de comandos de Xcode (`swiftc`).
 build/Guachiman.app/Contents/MacOS/Guachiman --once
 ```
 
-Imprime una tabla con pid, etiqueta, MB totales y cwd de cada sesión, los huérfanos, las 10 apps que más RAM usan (con su CPU medida en ~1 s), la memoria libre y los umbrales calculados, y termina sin abrir la interfaz. Sirve como `doctor`.
+Imprime una tabla con pid, etiqueta, MB totales, estado (verde, amarillo o rojo; el gris no se puede saber con una sola muestra) y cwd de cada sesión, los huérfanos, las 10 apps que más RAM usan (con su CPU medida en ~1 s), la memoria libre y los umbrales calculados, y termina sin abrir la interfaz. Sirve como `doctor`.
 
 ## Umbrales
 
