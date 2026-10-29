@@ -45,11 +45,18 @@ Nunca se señalan los pids 0 y 1 ni el propio Guachiman. El menú se construye a
 
 - **Cerrar huérfanos automáticamente** (apagado por defecto, se recuerda entre ejecuciones): si lo activas, un huérfano de más de 500 MB sostenido por 10 min recibe SIGTERM junto con sus descendientes, tras reverificar que sigue siendo huérfano. No se escala a SIGKILL y se te notifica qué se cerró.
 - **Cerrar procesos que saturen el PC** (apagado por defecto, se recuerda entre ejecuciones, `autoKillSaturating`): si lo activas y la memoria libre del sistema baja de 20 %, un huérfano (ppid 1: node, vitest, next, playwright) de más de 500 MB genera la notificación "Guachiman cerrará X en 15 s". Si no pulsas "Cancelar cierre de X (pid N)" en el menú, recibe SIGTERM junto con sus descendientes, tras reverificar. Solo huérfanos: nunca sesiones de Claude ni apps, para no perder trabajo.
+- **Auto-compact de Claude** (submenú: "Por defecto de Claude", 50 %, 60 %, 70 %, 80 %; marca la opción activa): escribe `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (p. ej. `"70"`) en `~/.claude/settings.json`, el porcentaje de contexto al que Claude Code dispara el auto-compact. Solo toca esa clave (conserva el resto del archivo, lo crea como `{}` si no existe, y "Por defecto" la borra y elimina `env` si queda vacío); la escritura es atómica (archivo temporal + rename). Si el JSON no se puede leer no escribe nada y te avisa. Claude Code lee los ajustes al arrancar, así que aplica a sesiones nuevas; para las ya abiertas ver "% de contexto" abajo.
 - **Pausar 1 h**: durante una hora no hay notificaciones ni cierres automáticos; el menú y el ícono siguen actualizándose. Mientras dura aparece "Reanudar (pausado hasta HH:mm)", que cancela la pausa.
 - **Iniciar al encender**: crea o borra `~/Library/LaunchAgents/io.github.guachiman.plist` (surte efecto en el próximo inicio de sesión). "Salir" termina con estado 0, así que no se relanza.
 - **Actualizar**: ejecuta `brew update` y `brew upgrade guachiman` y reinicia la app si hay una versión nueva; solo funciona con la instalación de Homebrew (equivale a `guachiman --update`).
 - **Desinstalar**: tras confirmar, borra la app, la instalación de Homebrew, la copia en `~/Applications`, los ajustes y los datos (equivale a `guachiman --uninstall`).
 - Solo se ejecuta una instancia a la vez.
+
+## % de contexto por sesión
+
+Cada fila de sesión de Claude muestra "ctx NN%" junto al título: tokens del último mensaje con `usage` de la transcripción (`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`) sobre la ventana, que es 1 M si el modelo contiene "[1m]" o el uso supera 200 k, y 200 k en otro caso. Solo se lee la cola (256 KB) de la transcripción, al abrir el panel (y en `--once`, columna `CTX`), y se cachea por mtime: el sondeo no la toca. Sin dato no se muestra nada.
+
+Si eliges un umbral en "Auto-compact de Claude", el "ctx NN%" se pinta en amarillo al alcanzarlo y en rojo 10 puntos después. Con la IA encendida, al abrir el panel una sesión por encima del umbral genera una alerta `context` (como máximo una cada 10 min por sesión) y el relay le pide ejecutar `/compact` o cerrar y empezar una sesión nueva.
 
 ## Avisos a la sesión de Claude (interruptor "IA")
 
@@ -67,6 +74,7 @@ Campos de cada línea:
 
 - Sesión: `kind` ("session"), `ts`, `pid` (raíz de Claude), `mb`, `limit_mb`, `cwd`, `title` (el título de la sesión si ya se conocía, si no `null`) y `top` (`pid`, `mb` y `cmd` del hijo más grande).
 - Huérfano: `kind` ("orphan"), `ts`, `pid`, `name`, `mb`, `limit_mb` y `cwd`.
+- Contexto: `kind` ("context"), `ts`, `pid`, `pct`, `limit_pct`, `cwd` y `title`.
 
 Antes de escribir, si el archivo pesa más de 1 MB se renombra a `alerts.jsonl.1` (sobrescribe el anterior). Guachiman no habla con Claude: solo deja el evento escrito.
 

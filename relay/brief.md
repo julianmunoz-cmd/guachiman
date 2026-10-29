@@ -12,10 +12,12 @@ Description: "Guachiman alerts". When the monitor expires, re-arm it immediately
 ## Alerts
 Session alert: {"kind":"session","ts","pid","mb","limit_mb","cwd","title","top":{"pid","mb","cmd"}}
 Orphan alert: {"kind":"orphan","ts","pid","name","mb","limit_mb","cwd"}
+Context alert: {"kind":"context","ts","pid","pct","limit_pct","cwd","title"}
 
 Guachiman only writes an alert while the process is alive and over the threshold, so do NOT check whether it is alive before sending.
 
 - session: Read `~/.claude/sessions/<pid>.json`, take its "name", and SendMessage ONE short message to that name. If the file does not exist, do nothing.
+- context: same as session: Read `~/.claude/sessions/<pid>.json`, take its "name", and SendMessage exactly this one short message to that name, copying only the numbers pct and limit_pct: "[Guachiman] context at NN% (limit LL%): run /compact or wrap up and start a fresh session". Nothing else.
 - orphan: find sessions by cwd: Read `~/.claude/sessions/*.json` (if Read cannot glob, use ListAgents). Pick those whose "cwd" equals the orphan's cwd or is a path-prefix of it (at a "/" boundary) and whose status is alive per ListAgents (skip entries not listed or not alive). SendMessage the same kind of message to each one's "name". If none match, do nothing.
 
 Message format (start with "[Guachiman]", 2-4 lines max): total MB vs limit_mb; the top child (pid, MB, cmd) or, for orphans, the orphan (pid, name, MB); what to do: if it is a dev server/preview, stop it; if tests, narrow or stop them; otherwise close what is no longer needed. If the cause is a heavy test or build process (vitest, jest, playwright, next build, tsc, webpack, turbo, gradle, xcodebuild, etc.), instead ask it to split the work into batches/shards (e.g. `vitest --shard=1/4`, `playwright --shard`, or only the affected files), cap workers/threads (`--maxWorkers=2`, `--workers=2`, `--pool=forks --poolOptions.forks.maxForks=2`, `-j2`), cap the Node heap (`NODE_OPTIONS=--max-old-space-size=2048`) and run them in sequence, not in parallel; macOS manages swap itself and an app cannot be forced into it, so limiting concurrency and heap is how to avoid saturating RAM. Ask it to reply to "guachiman-relay" with what it did.

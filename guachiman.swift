@@ -471,10 +471,109 @@ func sessionTitle(pid: pid_t) -> String? {
 /// Título ya conocido, sin leer disco.
 func cachedSessionTitle(pid: pid_t) -> String? { titleCache[pid]?.title }
 
-func pruneTitleCache(live: Set<pid_t>) { titleCache = titleCache.filter { live.contains($0.key) } }
+func pruneTitleCache(live: Set<pid_t>) {
+    titleCache = titleCache.filter { live.contains($0.key) }
+    ctxCache = ctxCache.filter { live.contains($0.key) }
+}
 
 /// Etiqueta visible: título de Claude Code (máx. 50) o, sin él, la carpeta.
 func sessionLabel(_ s: Session) -> String { sessionTitle(pid: s.pid).map(truncatedTitle) ?? s.label }
+
+/// Ventana de contexto: 1 M si el modelo lo declara ("[1m]") o el uso ya supera 200 k; si no, 200 k.
+func contextWindow(model: String?, used: Int) -> Int {
+    (model?.lowercased().contains("[1m]") == true || used > 200_000) ? 1_000_000 : 200_000
+}
+
+func contextPercent(used: Int, window: Int) -> Int { window > 0 ? Int((Double(used) / Double(window) * 100).rounded()) : 0 }
+
+/// Último mensaje con `message.usage` (no vacío) del texto de una transcripción; ignora líneas rotas.
+func parseContextUsage(_ text: String) -> (used: Int, model: String?)? {
+    for line in text.split(separator: "\n").reversed() where line.contains("\"usage\"") {
+        guard let o = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
+              let m = o["message"] as? [String: Any], let u = m["usage"] as? [String: Any] else { continue }
+        func n(_ k: String) -> Int { (u[k] as? NSNumber)?.intValue ?? 0 }
+        let used = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens")
+        if used > 0 { return (used, m["model"] as? String) }
+    }
+    return nil
+}
+
+/// Color del "ctx NN%": amarillo al llegar al umbral de auto-compact elegido, rojo 10 puntos después; sin umbral, tenue.
+func contextTone(percent: Int, limitPct: Int?) -> RowColor? {
+    guard let limitPct else { return nil }
+    return percent >= limitPct + 10 ? .red : (percent >= limitPct ? .yellow : nil)
+}
+
+/// Línea de `alerts.jsonl` para una sesión cuyo contexto superó el umbral de auto-compact.
+func contextAlertLine(ts: Int, pid: pid_t, pct: Int, limitPct: Int, cwd: String, title: String?) -> String {
+    jsonLine(["kind": "context", "ts": ts, "pid": Int(pid), "pct": pct, "limit_pct": limitPct,
+              "cwd": sanitizeText(cwd), "title": title.map { sanitizeText($0) } ?? NSNull()])
+}
+
+let autoCompactEnvKey = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+
+/// Porcentaje de auto-compact guardado en `env` de settings.json (nil = por defecto de Claude).
+func autoCompactPct(_ root: [String: Any]) -> Int? {
+    let v = (root["env"] as? [String: Any])?[autoCompactEnvKey]
+    return (v as? String).flatMap { Int($0) } ?? (v as? NSNumber)?.intValue
+}
+
+/// Copia de settings con solo `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` cambiado; nil lo elimina (y `env` si queda vacío).
+func applyAutoCompact(_ root: [String: Any], pct: Int?) -> [String: Any] {
+    var r = root
+    var env = (r["env"] as? [String: Any]) ?? [:]
+    if let pct { env[autoCompactEnvKey] = String(pct) } else { env[autoCompactEnvKey] = nil }
+    r["env"] = env.isEmpty ? nil : env
+    return r
+}
+
+private let claudeSettingsPath = claudeDir + "/settings.json"
+
+/// nil si el archivo existe pero no es un JSON objeto; `[:]` si no existe.
+private func readClaudeSettings() -> [String: Any]? {
+    guard let data = FileManager.default.contents(atPath: claudeSettingsPath) else { return [:] }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+private func writeClaudeSettings(_ root: [String: Any]) throws {
+    let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+    let url = URL(fileURLWithPath: claudeSettingsPath).resolvingSymlinksInPath()
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url, options: .atomic)
+}
+
+struct ContextInfo { var pct: Int }
+private struct CtxEntry { var path: String?; var mtime: Date; var info: ContextInfo? }
+private var ctxCache: [pid_t: CtxEntry] = [:]
+
+/// % de contexto de la sesión según la cola de su transcripción. Solo se llama al abrir el panel o en `--once`;
+/// relee únicamente si cambió el mtime.
+func sessionContext(pid: pid_t) -> ContextInfo? {
+    var entry = ctxCache[pid] ?? CtxEntry(path: nil, mtime: .distantPast, info: nil)
+    defer { ctxCache[pid] = entry }
+    if entry.path == nil {
+        guard let data = FileManager.default.contents(atPath: "\(claudeDir)/sessions/\(pid).json"),
+              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let sid = o["sessionId"] as? String, let cwd = o["cwd"] as? String else { return nil }
+        entry.path = transcriptPath(sessionId: sid, cwd: cwd)
+    }
+    guard let path = entry.path,
+          let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    else { entry.path = nil; return nil }
+    if mtime == entry.mtime { return entry.info }
+    entry.mtime = mtime
+    entry.info = nil
+    guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? fh.close() }
+    let size = (try? fh.seekToEnd()) ?? 0
+    let tail: UInt64 = 256 * 1024
+    try? fh.seek(toOffset: size > tail ? size - tail : 0)
+    let text = String(decoding: (try? fh.readToEnd()) ?? Data(), as: UTF8.self)
+    if let u = parseContextUsage(text) {
+        entry.info = ContextInfo(pct: contextPercent(used: u.used, window: contextWindow(model: u.model, used: u.used)))
+    }
+    return entry.info
+}
 
 func runSelfTest() {
     precondition(parseAuthLoggedIn(Data(#"{"loggedIn":true,"authMethod":"claude.ai"}"#.utf8)))
@@ -619,6 +718,22 @@ func runSelfTest() {
     precondition(extractSessionTitle("{\"type\":\"ai-title\",\"aiTitle\":\"uno\"}\nbasura\n{\"type\":\"ai-title\",\"aiTitle\":\"dos\"}") == "dos")
     precondition(extractSessionTitle("{\"type\":\"user\"}\n") == nil)
     precondition(truncatedTitle(String(repeating: "x", count: 60)).count == 50 && truncatedTitle("hola") == "hola")
+    precondition(contextWindow(model: "claude-opus-4-8[1m]", used: 10) == 1_000_000 && contextWindow(model: "claude-x", used: 200_000) == 200_000)
+    precondition(contextWindow(model: nil, used: 200_001) == 1_000_000 && contextWindow(model: "claude-x", used: 5) == 200_000)
+    precondition(contextPercent(used: 100_000, window: 200_000) == 50 && contextPercent(used: 1, window: 0) == 0)
+    let tr = "{\"message\":{\"model\":\"m[1m]\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":3}}}\n"
+        + "{\"message\":{\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":0}}}\n{\"type\":\"user\"}\nrota{\"usage\"\n"
+    let cu = parseContextUsage(tr)
+    precondition(cu?.used == 24 && cu?.model == "m[1m]" && parseContextUsage("{\"type\":\"user\"}") == nil)
+    precondition(contextTone(percent: 60, limitPct: 70) == nil && contextTone(percent: 70, limitPct: 70) == .yellow
+                 && contextTone(percent: 80, limitPct: 70) == .red && contextTone(percent: 99, limitPct: nil) == nil)
+    let cl = (try? JSONSerialization.jsonObject(with: Data(contextAlertLine(ts: 1, pid: 2, pct: 75, limitPct: 70, cwd: "/x", title: "t\nz").utf8))) as? [String: Any]
+    precondition(cl?["kind"] as? String == "context" && cl?["pct"] as? Int == 75 && cl?["limit_pct"] as? Int == 70 && cl?["title"] as? String == "tz")
+    let base: [String: Any] = ["model": "opus", "env": ["FOO": "1"]]
+    let on = applyAutoCompact(base, pct: 70)
+    precondition(autoCompactPct(on) == 70 && (on["env"] as? [String: Any])?["FOO"] as? String == "1" && on["model"] as? String == "opus")
+    precondition(autoCompactPct(applyAutoCompact(on, pct: nil)) == nil && (applyAutoCompact(on, pct: nil)["env"] as? [String: Any])?["FOO"] as? String == "1")
+    precondition(applyAutoCompact(applyAutoCompact([:], pct: 50), pct: nil).isEmpty && autoCompactPct(["env": [autoCompactEnvKey: 60]]) == 60)
     print("selftest OK")
 }
 
@@ -869,9 +984,9 @@ func runOnce() {
     func status(_ bytes: UInt64, _ cpu: Double, _ ramLimit: UInt64, _ cpuLimit: Double?) -> String {
         rowColor(bytes: bytes, cpu: cpu, ramLimit: ramLimit, cpuLimit: cpuLimit, idleFor: 0).rawValue
     }
-    print("PID\tETIQUETA\tTITULO\tTOTAL_MB\tESTADO\tCWD")
+    print("PID\tETIQUETA\tTITULO\tTOTAL_MB\tESTADO\tCTX\tCWD")
     for s in snap.sessions {
-        print("\(s.pid)\t\(s.label)\t\(sessionTitle(pid: s.pid).map(truncatedTitle) ?? "-")\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(s.cwd)")
+        print("\(s.pid)\t\(s.label)\t\(sessionTitle(pid: s.pid).map(truncatedTitle) ?? "-")\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(sessionContext(pid: s.pid).map { "\($0.pct)%" } ?? "-")\t\(s.cwd)")
     }
     if snap.sessions.isEmpty { print("(sin sesiones de Claude)") }
     print("")
@@ -1029,7 +1144,7 @@ final class PanelRow: FlippedView {
     private var area: NSTrackingArea?
 
     init(width: CGFloat, text: String, memory: String, cpu: String, color: NSColor, stopTag: Int?, stopLabel: String,
-         stopTip: String, target: AnyObject, action: Selector) {
+         stopTip: String, target: AnyObject, action: Selector, ctx: (text: String, color: NSColor)? = nil) {
         let colW: CGFloat = 30, memW: CGFloat = 64
         let colX = width - 8 - colW
         let memX = colX - 8 - memW
@@ -1043,7 +1158,12 @@ final class PanelRow: FlippedView {
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.cornerRadius = 3
         addSubview(dot)
-        addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22, height: 16)))
+        let ctxW: CGFloat = ctx == nil ? 0 : 52
+        addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22 - ctxW, height: 16)))
+        if let ctx {
+            addSubview(panelLabel(ctx.text, size: 10.5, mono: true, color: ctx.color, align: .right,
+                                  frame: NSRect(x: memX - 4 - ctxW, y: 5, width: ctxW, height: 14)))
+        }
         addSubview(panelLabel(memory, size: 11, mono: true, color: Pal.muted, align: .right,
                               frame: NSRect(x: memX, y: 5, width: memW, height: 14)))
         addSubview(cpuLabel)
@@ -1351,6 +1471,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendingKill = nil
     }
 
+    /// Solo cambia `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` de ~/.claude/settings.json; no escribe si el JSON no se puede leer.
+    @objc private func setAutoCompact(_ sender: NSMenuItem) {
+        guard let root = readClaudeSettings() else {
+            notifier.send("No se pudo leer ~/.claude/settings.json (JSON inválido): no se modificó")
+            return
+        }
+        do { try writeClaudeSettings(applyAutoCompact(root, pct: sender.representedObject as? Int)) } catch {
+            notifier.send("No se pudo escribir ~/.claude/settings.json: \(error.localizedDescription)")
+            return
+        }
+        if let p = panel { fillPanel(p) }
+    }
+
     @objc private func toggleAutoKillSaturating() { autoKillSaturating.toggle() }
 
     @objc private func togglePause() {
@@ -1646,7 +1779,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         rowTargets = []
-        func addRow(_ text: String, _ bytes: UInt64, _ cpu: Double, _ color: RowColor, _ t: KillTarget, tip: String) {
+        func addRow(_ text: String, _ bytes: UInt64, _ cpu: Double, _ color: RowColor, _ t: KillTarget, tip: String,
+                    ctx: (text: String, color: NSColor)? = nil) {
             var tag: Int?
             if !t.pids.isEmpty, !t.pids.contains(getpid()) {   // nunca ofrece cerrar a Guachiman
                 rowTargets.append(t)
@@ -1654,7 +1788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let r = PanelRow(width: iw, text: text, memory: formatBytes(bytes), cpu: "\(Int(cpu.rounded()))%",
                              color: nsColor(color), stopTag: tag, stopLabel: "Cerrar \(t.name)", stopTip: tip,
-                             target: self, action: #selector(stopClicked(_:)))
+                             target: self, action: #selector(stopClicked(_:)), ctx: ctx)
             r.frame.origin = NSPoint(x: pad, y: y)
             root.addSubview(r)
             y += rowH
@@ -1703,13 +1837,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                        frame: NSRect(x: pad + 8, y: y + 4, width: iw - 16, height: 16)))
             y += rowH
         }
+        let limitPct = readClaudeSettings().flatMap(autoCompactPct)
         for s in sessions {
             let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
                              idleFor: lastIdle["session:\(s.pid)"] ?? 0)
             let title = sessionTitle(pid: s.pid).map(truncatedTitle)
+            var ctx: (text: String, color: NSColor)?
+            if let info = sessionContext(pid: s.pid) {
+                let tone = contextTone(percent: info.pct, limitPct: limitPct)
+                ctx = ("ctx \(info.pct)%", tone.map(nsColor) ?? Pal.muted)
+                if let limitPct, tone != nil, aiEnabled,
+                   alert(key: "context:\(s.pid)", value: Double(info.pct),
+                         text: "Sesión \(title ?? s.label) al \(info.pct) % de contexto (límite \(limitPct) %)", now: Date()) {
+                    startRelayIfNeeded()
+                    appendAlert(contextAlertLine(ts: Int(Date().timeIntervalSince1970), pid: s.pid, pct: info.pct,
+                                                 limitPct: limitPct, cwd: s.cwd, title: title))
+                }
+            }
             addRow(title ?? s.label, s.bytes, s.cpu, c,
                    KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false),
-                   tip: "Detener")
+                   tip: "Detener", ctx: ctx)
         }
 
         divider(topMargin: 2)
@@ -1763,6 +1910,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(NSMenuItem(title: "Cancelar cierre de \(pending.name) (pid \(pending.pid))",
                                     action: #selector(cancelPendingKill), keyEquivalent: ""))
         }
+        let acItem = NSMenuItem(title: "Auto-compact de Claude", action: nil, keyEquivalent: "")
+        let acMenu = NSMenu()
+        let acCurrent = readClaudeSettings().flatMap(autoCompactPct)
+        for pct in [nil, 50, 60, 70, 80] as [Int?] {
+            let it = NSMenuItem(title: pct.map { "\($0) %" } ?? "Por defecto de Claude", action: #selector(setAutoCompact(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = pct
+            it.state = pct == acCurrent ? .on : .off
+            acMenu.addItem(it)
+        }
+        acItem.submenu = acMenu
+        menu.addItem(acItem)
         menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
                             on: FileManager.default.fileExists(atPath: agentURL.path)))
         if !notifier.isAuthorized {
