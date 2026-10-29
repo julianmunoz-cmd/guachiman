@@ -29,8 +29,8 @@ enum Config {
     static let warnFraction = 0.75               // amarillo: >= 75 % de un umbral
     static let pauseDuration: TimeInterval = 3600
     static let updateCheckInterval: TimeInterval = 6 * 3600
-    static let releasesLatestURL = "https://api.github.com/repos/xklbr/guachiman/releases/latest"
-    static let releasesPageURL = "https://github.com/xklbr/guachiman/releases/latest"
+    static let tagsURL = "https://api.github.com/repos/xklbr/guachiman/tags?per_page=20"
+    static let releasesPageURL = "https://github.com/xklbr/guachiman/releases"
     static let lastUpdateCheckKey = "lastUpdateCheck"
     static let notifiedVersionKey = "notifiedVersion"
     static let autoCloseKey = "autoCloseOrphans"
@@ -161,12 +161,16 @@ func isNewerVersion(_ a: String, than b: String) -> Bool {
     return x.lexicographicallyPrecedes(y) ? false : x != y
 }
 
-/// `tag_name` de la release sin "v", solo si no es draft/prerelease y pasa `parseVersion`.
-func latestVersion(fromReleaseJSON data: Data) -> String? {
-    guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-          (obj["draft"] as? Bool) != true, (obj["prerelease"] as? Bool) != true,
-          let tag = obj["tag_name"] as? String, parseVersion(tag) != nil else { return nil }
-    return tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+/// Mayor versión entre los `name` de los tags que pasan `parseVersion` (sin "v"); no asume orden.
+func latestVersion(fromTagsJSON data: Data) -> String? {
+    guard let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return nil }
+    var best: String?
+    for tag in arr {
+        guard let name = tag["name"] as? String, parseVersion(name) != nil else { continue }
+        let v = name.hasPrefix("v") ? String(name.dropFirst()) : name
+        if best == nil || isNewerVersion(v, than: best!) { best = v }
+    }
+    return best
 }
 
 func shouldCheckForUpdate(last: Date?, now: Date) -> Bool {
@@ -180,13 +184,13 @@ var installedVersion: String {
 
 /// Consulta anónima a la API pública de GitHub; nil ante cualquier fallo. El callback corre en otra cola.
 func fetchLatestVersion(completion: @escaping (String?) -> Void) {
-    guard let url = URL(string: Config.releasesLatestURL) else { return completion(nil) }
+    guard let url = URL(string: Config.tagsURL) else { return completion(nil) }
     var req = URLRequest(url: url, timeoutInterval: 10)
     req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
     req.setValue("Guachiman/\(installedVersion)", forHTTPHeaderField: "User-Agent")
     URLSession.shared.dataTask(with: req) { data, resp, _ in
         guard let data, (resp as? HTTPURLResponse)?.statusCode == 200 else { return completion(nil) }
-        completion(latestVersion(fromReleaseJSON: data))
+        completion(latestVersion(fromTagsJSON: data))
     }.resume()
 }
 
@@ -873,11 +877,10 @@ func runSelfTest() {
     precondition(isNewerVersion("0.10.0", than: "0.9.9") && !isNewerVersion("0.9.9", than: "0.10.0"))
     precondition(!isNewerVersion("0.7", than: "0.7.0") && !isNewerVersion("0.7.0", than: "0.7"))
     precondition(isNewerVersion("v0.7.1", than: "0.7") && !isNewerVersion("junk", than: "0.7"))
-    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"v0.8.0","draft":false,"prerelease":false}"#.utf8)) == "0.8.0")
-    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"v0.8.0","prerelease":true}"#.utf8)) == nil)
-    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"v0.8.0","draft":true}"#.utf8)) == nil)
-    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"<b>x</b>"}"#.utf8)) == nil)
-    precondition(latestVersion(fromReleaseJSON: Data(#"{}"#.utf8)) == nil && latestVersion(fromReleaseJSON: Data("no".utf8)) == nil)
+    precondition(latestVersion(fromTagsJSON: Data(#"[{"name":"v0.6.2"},{"name":"v0.7.0"},{"name":"v0.8.0-beta"},{"name":"foo"}]"#.utf8)) == "0.7.0")
+    precondition(latestVersion(fromTagsJSON: Data("[]".utf8)) == nil)
+    precondition(latestVersion(fromTagsJSON: Data(#"[{"name":"foo"},{"name":"v1-rc"},{}]"#.utf8)) == nil)
+    precondition(latestVersion(fromTagsJSON: Data(#"{"name":"v0.8.0"}"#.utf8)) == nil && latestVersion(fromTagsJSON: Data("no".utf8)) == nil)
     precondition(shouldCheckForUpdate(last: nil, now: now))
     precondition(!shouldCheckForUpdate(last: now - 60, now: now))
     precondition(shouldCheckForUpdate(last: now - Config.updateCheckInterval, now: now))
