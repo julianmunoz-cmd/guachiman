@@ -479,35 +479,21 @@ func pruneTitleCache(live: Set<pid_t>) {
 /// Etiqueta visible: título de Claude Code (máx. 50) o, sin él, la carpeta.
 func sessionLabel(_ s: Session) -> String { sessionTitle(pid: s.pid).map(truncatedTitle) ?? s.label }
 
-/// Ventana de contexto: 1 M si el modelo lo declara ("[1m]") o el uso ya supera 200 k; si no, 200 k.
-func contextWindow(model: String?, used: Int) -> Int {
-    (model?.lowercased().contains("[1m]") == true || used > 200_000) ? 1_000_000 : 200_000
+/// "ctx 192k": tokens usados redondeados a miles; menos de 1 000 → "ctx <1k".
+func formatContextTokens(_ used: Int) -> String {
+    used < 1000 ? "ctx <1k" : "ctx \((used + 500) / 1000)k"
 }
 
-func contextPercent(used: Int, window: Int) -> Int { window > 0 ? Int((Double(used) / Double(window) * 100).rounded()) : 0 }
-
 /// Último mensaje con `message.usage` (no vacío) del texto de una transcripción; ignora líneas rotas.
-func parseContextUsage(_ text: String) -> (used: Int, model: String?)? {
+func parseContextUsage(_ text: String) -> Int? {
     for line in text.split(separator: "\n").reversed() where line.contains("\"usage\"") {
         guard let o = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
               let m = o["message"] as? [String: Any], let u = m["usage"] as? [String: Any] else { continue }
         func n(_ k: String) -> Int { (u[k] as? NSNumber)?.intValue ?? 0 }
         let used = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens")
-        if used > 0 { return (used, m["model"] as? String) }
+        if used > 0 { return used }
     }
     return nil
-}
-
-/// Color del "ctx NN%": amarillo al llegar al umbral de auto-compact elegido, rojo 10 puntos después; sin umbral, tenue.
-func contextTone(percent: Int, limitPct: Int?) -> RowColor? {
-    guard let limitPct else { return nil }
-    return percent >= limitPct + 10 ? .red : (percent >= limitPct ? .yellow : nil)
-}
-
-/// Línea de `alerts.jsonl` para una sesión cuyo contexto superó el umbral de auto-compact.
-func contextAlertLine(ts: Int, pid: pid_t, pct: Int, limitPct: Int, cwd: String, title: String?) -> String {
-    jsonLine(["kind": "context", "ts": ts, "pid": Int(pid), "pct": pct, "limit_pct": limitPct,
-              "cwd": sanitizeText(cwd), "title": title.map { sanitizeText($0) } ?? NSNull()])
 }
 
 let autoCompactEnvKey = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
@@ -527,6 +513,123 @@ func applyAutoCompact(_ root: [String: Any], pct: Int?) -> [String: Any] {
     return r
 }
 
+/// Edición textual mínima de `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` en el texto de settings.json (conserva orden y formato).
+/// nil = no se pudo editar con seguridad. Texto vacío = archivo inexistente.
+func editAutoCompact(text: String, pct: Int?) -> String? {
+    let b = Array(text.utf8)
+    let keyBytes = Array(autoCompactEnvKey.utf8)
+    let valueBytes = Array("\"\(pct ?? 0)\"".utf8)
+    let entry = Array("\"\(autoCompactEnvKey)\": ".utf8) + valueBytes
+    let envEntry = Array("\"env\": {".utf8) + entry + Array("}".utf8)
+    func splice(_ r: Range<Int>, _ ins: [UInt8]) -> String? {
+        String(bytes: Array(b[..<r.lowerBound]) + ins + Array(b[r.upperBound...]), encoding: .utf8)
+    }
+    func insertFirst(_ o: JSONObjectSpan, _ item: [UInt8]) -> String? {
+        guard let first = o.members.first else { return splice((o.open + 1)..<o.close, item) }
+        var sep = Array(", ".utf8)
+        if let nl = b[(o.open + 1)..<first.keyStart].lastIndex(of: 0x0A) {
+            sep = [0x2C, 0x0A] + Array(b[(nl + 1)..<first.keyStart])
+        }
+        return splice(first.keyStart..<first.keyStart, item + sep)
+    }
+    func remove(_ o: JSONObjectSpan, _ k: Int) -> String? {
+        let m = o.members
+        if m.count == 1 { return splice((o.open + 1)..<o.close, []) }
+        if k < m.count - 1 { return splice(m[k].keyStart..<m[k + 1].keyStart, []) }
+        return splice(m[k - 1].valEnd..<m[k].valEnd, [])
+    }
+    if text.isEmpty { return pct == nil ? text : "{" + String(decoding: envEntry, as: UTF8.self) + "}" }
+    guard let root = jsonObjectSpan(b, at: jsonSkipWS(b, 0)), jsonSkipWS(b, root.close + 1) == b.count else { return nil }
+    if let ei = root.members.firstIndex(where: { $0.keyName == Array("env".utf8) }) {
+        let em = root.members[ei]
+        guard let env = jsonObjectSpan(b, at: em.valStart), env.close + 1 == em.valEnd else { return nil }
+        if let ki = env.members.firstIndex(where: { $0.keyName == keyBytes }) {
+            if pct != nil { return splice(env.members[ki].valStart..<env.members[ki].valEnd, valueBytes) }
+            return env.members.count == 1 ? remove(root, ei) : remove(env, ki)
+        }
+        if pct == nil { return env.members.isEmpty ? remove(root, ei) : text }
+        return insertFirst(env, entry)
+    }
+    return pct == nil ? text : insertFirst(root, envEntry)
+}
+
+/// `editAutoCompact` solo si el resultado equivale a `applyAutoCompact` sobre el original; nil si no.
+func verifiedAutoCompactEdit(text: String, pct: Int?) -> String? {
+    func parse(_ t: String) -> [String: Any]? {
+        t.isEmpty ? [:] : (try? JSONSerialization.jsonObject(with: Data(t.utf8))) as? [String: Any]
+    }
+    guard let orig = parse(text), let out = editAutoCompact(text: text, pct: pct), let got = parse(out),
+          NSDictionary(dictionary: got).isEqual(to: applyAutoCompact(orig, pct: pct)) else { return nil }
+    return out
+}
+
+private struct JSONMember { var keyStart: Int; var keyName: [UInt8]; var valStart: Int; var valEnd: Int }
+private struct JSONObjectSpan { var open: Int; var close: Int; var members: [JSONMember] }
+
+private func jsonSkipWS(_ b: [UInt8], _ i: Int) -> Int {
+    var i = i
+    while i < b.count, b[i] == 0x20 || b[i] == 0x09 || b[i] == 0x0A || b[i] == 0x0D { i += 1 }
+    return i
+}
+
+/// `i` apunta a la comilla de apertura; devuelve el índice posterior a la de cierre.
+private func jsonStringEnd(_ b: [UInt8], _ i: Int) -> Int? {
+    var j = i + 1
+    while j < b.count {
+        if b[j] == 0x5C { j += 2; continue }
+        if b[j] == 0x22 { return j + 1 }
+        j += 1
+    }
+    return nil
+}
+
+private func jsonValueEnd(_ b: [UInt8], _ i: Int) -> Int? {
+    guard i < b.count else { return nil }
+    if b[i] == 0x22 { return jsonStringEnd(b, i) }
+    var j = i
+    if b[i] == 0x7B || b[i] == 0x5B {
+        var depth = 0
+        while j < b.count {
+            switch b[j] {
+            case 0x22:
+                guard let e = jsonStringEnd(b, j) else { return nil }
+                j = e
+                continue
+            case 0x7B, 0x5B: depth += 1
+            case 0x7D, 0x5D:
+                depth -= 1
+                if depth == 0 { return j + 1 }
+            default: break
+            }
+            j += 1
+        }
+        return nil
+    }
+    while j < b.count, ![0x2C, 0x7D, 0x5D, 0x20, 0x09, 0x0A, 0x0D].contains(b[j]) { j += 1 }
+    return j > i ? j : nil
+}
+
+private func jsonObjectSpan(_ b: [UInt8], at open: Int) -> JSONObjectSpan? {
+    guard open < b.count, b[open] == 0x7B else { return nil }
+    var members: [JSONMember] = []
+    var i = jsonSkipWS(b, open + 1)
+    if i < b.count, b[i] == 0x7D { return JSONObjectSpan(open: open, close: i, members: []) }
+    while i < b.count, b[i] == 0x22 {
+        guard let ke = jsonStringEnd(b, i) else { return nil }
+        var j = jsonSkipWS(b, ke)
+        guard j < b.count, b[j] == 0x3A else { return nil }
+        j = jsonSkipWS(b, j + 1)
+        guard let ve = jsonValueEnd(b, j) else { return nil }
+        members.append(JSONMember(keyStart: i, keyName: Array(b[(i + 1)..<(ke - 1)]), valStart: j, valEnd: ve))
+        i = jsonSkipWS(b, ve)
+        guard i < b.count else { return nil }
+        if b[i] == 0x7D { return JSONObjectSpan(open: open, close: i, members: members) }
+        guard b[i] == 0x2C else { return nil }
+        i = jsonSkipWS(b, i + 1)
+    }
+    return nil
+}
+
 private let claudeSettingsPath = claudeDir + "/settings.json"
 
 /// nil si el archivo existe pero no es un JSON objeto; `[:]` si no existe.
@@ -535,18 +638,18 @@ private func readClaudeSettings() -> [String: Any]? {
     return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
 }
 
-private func writeClaudeSettings(_ root: [String: Any]) throws {
-    let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+private func writeClaudeSettings(text: String) throws {
+    let data = Data(text.utf8)
     let url = URL(fileURLWithPath: claudeSettingsPath).resolvingSymlinksInPath()
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     try data.write(to: url, options: .atomic)
 }
 
-struct ContextInfo { var pct: Int }
+struct ContextInfo { var used: Int }
 private struct CtxEntry { var path: String?; var mtime: Date; var info: ContextInfo? }
 private var ctxCache: [pid_t: CtxEntry] = [:]
 
-/// % de contexto de la sesión según la cola de su transcripción. Solo se llama al abrir el panel o en `--once`;
+/// Tokens de contexto usados por la sesión según la cola de su transcripción. Solo se llama al abrir el panel o en `--once`;
 /// relee únicamente si cambió el mtime.
 func sessionContext(pid: pid_t) -> ContextInfo? {
     var entry = ctxCache[pid] ?? CtxEntry(path: nil, mtime: .distantPast, info: nil)
@@ -570,7 +673,7 @@ func sessionContext(pid: pid_t) -> ContextInfo? {
     try? fh.seek(toOffset: size > tail ? size - tail : 0)
     let text = String(decoding: (try? fh.readToEnd()) ?? Data(), as: UTF8.self)
     if let u = parseContextUsage(text) {
-        entry.info = ContextInfo(pct: contextPercent(used: u.used, window: contextWindow(model: u.model, used: u.used)))
+        entry.info = ContextInfo(used: u)
     }
     return entry.info
 }
@@ -718,22 +821,65 @@ func runSelfTest() {
     precondition(extractSessionTitle("{\"type\":\"ai-title\",\"aiTitle\":\"uno\"}\nbasura\n{\"type\":\"ai-title\",\"aiTitle\":\"dos\"}") == "dos")
     precondition(extractSessionTitle("{\"type\":\"user\"}\n") == nil)
     precondition(truncatedTitle(String(repeating: "x", count: 60)).count == 50 && truncatedTitle("hola") == "hola")
-    precondition(contextWindow(model: "claude-opus-4-8[1m]", used: 10) == 1_000_000 && contextWindow(model: "claude-x", used: 200_000) == 200_000)
-    precondition(contextWindow(model: nil, used: 200_001) == 1_000_000 && contextWindow(model: "claude-x", used: 5) == 200_000)
-    precondition(contextPercent(used: 100_000, window: 200_000) == 50 && contextPercent(used: 1, window: 0) == 0)
-    let tr = "{\"message\":{\"model\":\"m[1m]\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":3}}}\n"
+    let tr = "{\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":3}}}\n"
         + "{\"message\":{\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":0}}}\n{\"type\":\"user\"}\nrota{\"usage\"\n"
-    let cu = parseContextUsage(tr)
-    precondition(cu?.used == 24 && cu?.model == "m[1m]" && parseContextUsage("{\"type\":\"user\"}") == nil)
-    precondition(contextTone(percent: 60, limitPct: 70) == nil && contextTone(percent: 70, limitPct: 70) == .yellow
-                 && contextTone(percent: 80, limitPct: 70) == .red && contextTone(percent: 99, limitPct: nil) == nil)
-    let cl = (try? JSONSerialization.jsonObject(with: Data(contextAlertLine(ts: 1, pid: 2, pct: 75, limitPct: 70, cwd: "/x", title: "t\nz").utf8))) as? [String: Any]
-    precondition(cl?["kind"] as? String == "context" && cl?["pct"] as? Int == 75 && cl?["limit_pct"] as? Int == 70 && cl?["title"] as? String == "tz")
+    precondition(parseContextUsage(tr) == 24 && parseContextUsage("{\"type\":\"user\"}") == nil)
+    precondition(formatContextTokens(0) == "ctx <1k" && formatContextTokens(999) == "ctx <1k" && formatContextTokens(1000) == "ctx 1k")
+    precondition(formatContextTokens(191_600) == "ctx 192k" && formatContextTokens(1_250_000) == "ctx 1250k")
     let base: [String: Any] = ["model": "opus", "env": ["FOO": "1"]]
     let on = applyAutoCompact(base, pct: 70)
     precondition(autoCompactPct(on) == 70 && (on["env"] as? [String: Any])?["FOO"] as? String == "1" && on["model"] as? String == "opus")
     precondition(autoCompactPct(applyAutoCompact(on, pct: nil)) == nil && (applyAutoCompact(on, pct: nil)["env"] as? [String: Any])?["FOO"] as? String == "1")
     precondition(applyAutoCompact(applyAutoCompact([:], pct: 50), pct: nil).isEmpty && autoCompactPct(["env": [autoCompactEnvKey: 60]]) == 60)
+    let K = autoCompactEnvKey
+    func chk(_ src: String, _ pct: Int?, _ want: String?) {
+        let out = editAutoCompact(text: src, pct: pct)
+        precondition(out == want, "editAutoCompact: \(String(describing: out))")
+        precondition(verifiedAutoCompactEdit(text: src, pct: pct) == (want == nil ? nil : out))
+    }
+    let pre = "{\n  \"permissions\": {\n    \"allow\": [\"Bash(ls)\"]\n  },\n"
+    let post = "  \"model\": \"opus\"\n}\n"
+    let envNoKey = "  \"env\": {\n    \"ZED\": \"1\",\n    \"ALPHA\": \"2\"\n  },\n"
+    let envMid = "  \"env\": {\n    \"ZED\": \"1\",\n    \"\(K)\": \"50\",\n    \"ALPHA\": \"2\"\n  },\n"
+    let envOnly = "  \"env\": {\n    \"\(K)\": 60\n  },\n"
+    // a
+    chk(pre + envMid + post, 70, pre + envMid.replacingOccurrences(of: "\"50\"", with: "\"70\"") + post)
+    chk(pre + envMid + post, nil, pre + envNoKey + post)
+    chk(pre + "  \"env\": {\n    \"ZED\": \"1\",\n    \"\(K)\": \"50\"\n  },\n" + post, nil,
+        pre + "  \"env\": {\n    \"ZED\": \"1\"\n  },\n" + post)
+    chk(pre + "  \"env\": {\n    \"\(K)\": \"50\",\n    \"ZED\": \"1\"\n  },\n" + post, nil,
+        pre + "  \"env\": {\n    \"ZED\": \"1\"\n  },\n" + post)
+    // b
+    chk(pre + envNoKey + post, 70, pre + "  \"env\": {\n    \"\(K)\": \"70\",\n    \"ZED\": \"1\",\n    \"ALPHA\": \"2\"\n  },\n" + post)
+    chk("{\"env\": {\"ZED\": \"1\"}}", 70, "{\"env\": {\"\(K)\": \"70\", \"ZED\": \"1\"}}")
+    chk(pre + "  \"env\": {},\n" + post, 70, pre + "  \"env\": {\"\(K)\": \"70\"},\n" + post)
+    chk(pre + envNoKey + post, nil, pre + envNoKey + post)
+    // c
+    chk(pre + post, 70, "{\n  \"env\": {\"\(K)\": \"70\"},\n  \"permissions\": {\n    \"allow\": [\"Bash(ls)\"]\n  },\n" + post)
+    chk("{}\n", 70, "{\"env\": {\"\(K)\": \"70\"}}\n")
+    chk("{}", 70, "{\"env\": {\"\(K)\": \"70\"}}")
+    chk("", 70, "{\"env\": {\"\(K)\": \"70\"}}")
+    chk("", nil, "")
+    // d
+    chk(pre + envOnly + post, nil, pre + post)
+    chk(pre + "  \"env\": {},\n" + post, nil, pre + post)
+    chk("{\n  \"env\": {\"\(K)\": \"1\"}\n}\n", nil, "{}\n")
+    chk("{\n  \"model\": \"opus\",\n  \"env\": {\"\(K)\": \"1\"}\n}\n", nil, "{\n  \"model\": \"opus\"\n}\n")
+    // e
+    chk(pre + envMid + "  \"model\": \"opus\"\n}", 80, pre + envMid.replacingOccurrences(of: "\"50\"", with: "\"80\"") + "  \"model\": \"opus\"\n}")
+    chk("{\"model\": 1}", 70, "{\"env\": {\"\(K)\": \"70\"}, \"model\": 1}")
+    // la clave y "env" dentro de strings de otras claves no se confunden
+    let note = "  \"note\": \"ver \\\"env\\\": {\\\"\(K)\\\": \\\"x\\\"} aquí\",\n"
+    chk("{\n" + note + envNoKey + post, 70, "{\n" + note + "  \"env\": {\n    \"\(K)\": \"70\",\n    \"ZED\": \"1\",\n    \"ALPHA\": \"2\"\n  },\n" + post)
+    chk("{\n" + note + post, 70, "{\n  \"env\": {\"\(K)\": \"70\"},\n" + note + post)
+    chk("{\n" + note + "  \"env\": {\n    \"\(K)\": \"5\"\n  }\n}\n", nil, "{\n" + note.dropLast(2) + "\n}\n")
+    // JSON inválido
+    chk("{\"a\": 1,}", 70, nil)
+    chk("{\"a\": \"x\": \"y\"}", 70, nil)
+    chk("{\"env\": 3}", 70, nil)
+    chk("[1]", 70, nil)
+    chk("{\"a\": 1} basura", 70, nil)
+    precondition(verifiedAutoCompactEdit(text: "   ", pct: 70) == nil)
     print("selftest OK")
 }
 
@@ -986,7 +1132,7 @@ func runOnce() {
     }
     print("PID\tETIQUETA\tTITULO\tTOTAL_MB\tESTADO\tCTX\tCWD")
     for s in snap.sessions {
-        print("\(s.pid)\t\(s.label)\t\(sessionTitle(pid: s.pid).map(truncatedTitle) ?? "-")\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(sessionContext(pid: s.pid).map { "\($0.pct)%" } ?? "-")\t\(s.cwd)")
+        print("\(s.pid)\t\(s.label)\t\(sessionTitle(pid: s.pid).map(truncatedTitle) ?? "-")\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(sessionContext(pid: s.pid).map { formatContextTokens($0.used) } ?? "-")\t\(s.cwd)")
     }
     if snap.sessions.isEmpty { print("(sin sesiones de Claude)") }
     print("")
@@ -1158,7 +1304,7 @@ final class PanelRow: FlippedView {
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.cornerRadius = 3
         addSubview(dot)
-        let ctxW: CGFloat = ctx == nil ? 0 : 52
+        let ctxW: CGFloat = ctx == nil ? 0 : 60
         addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22 - ctxW, height: 16)))
         if let ctx {
             addSubview(panelLabel(ctx.text, size: 10.5, mono: true, color: ctx.color, align: .right,
@@ -1471,15 +1617,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendingKill = nil
     }
 
-    /// Solo cambia `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` de ~/.claude/settings.json; no escribe si el JSON no se puede leer.
+    /// Edita solo el texto de `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` en ~/.claude/settings.json; no escribe si no se puede verificar.
     @objc private func setAutoCompact(_ sender: NSMenuItem) {
-        guard let root = readClaudeSettings() else {
-            notifier.send("No se pudo leer ~/.claude/settings.json (JSON inválido): no se modificó")
+        let data = FileManager.default.contents(atPath: claudeSettingsPath)
+        let text = data.map { String(data: $0, encoding: .utf8) } ?? ""
+        guard let text, let out = verifiedAutoCompactEdit(text: text, pct: sender.representedObject as? Int) else {
+            notifier.send("No se pudo editar ~/.claude/settings.json; cámbialo a mano")
             return
         }
-        do { try writeClaudeSettings(applyAutoCompact(root, pct: sender.representedObject as? Int)) } catch {
-            notifier.send("No se pudo escribir ~/.claude/settings.json: \(error.localizedDescription)")
-            return
+        if out != text {
+            do { try writeClaudeSettings(text: out) } catch {
+                notifier.send("No se pudo escribir ~/.claude/settings.json: \(error.localizedDescription)")
+                return
+            }
         }
         if let p = panel { fillPanel(p) }
     }
@@ -1837,23 +1987,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                        frame: NSRect(x: pad + 8, y: y + 4, width: iw - 16, height: 16)))
             y += rowH
         }
-        let limitPct = readClaudeSettings().flatMap(autoCompactPct)
         for s in sessions {
             let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
                              idleFor: lastIdle["session:\(s.pid)"] ?? 0)
             let title = sessionTitle(pid: s.pid).map(truncatedTitle)
             var ctx: (text: String, color: NSColor)?
-            if let info = sessionContext(pid: s.pid) {
-                let tone = contextTone(percent: info.pct, limitPct: limitPct)
-                ctx = ("ctx \(info.pct)%", tone.map(nsColor) ?? Pal.muted)
-                if let limitPct, tone != nil, aiEnabled,
-                   alert(key: "context:\(s.pid)", value: Double(info.pct),
-                         text: "Sesión \(title ?? s.label) al \(info.pct) % de contexto (límite \(limitPct) %)", now: Date()) {
-                    startRelayIfNeeded()
-                    appendAlert(contextAlertLine(ts: Int(Date().timeIntervalSince1970), pid: s.pid, pct: info.pct,
-                                                 limitPct: limitPct, cwd: s.cwd, title: title))
-                }
-            }
+            if let info = sessionContext(pid: s.pid) { ctx = (formatContextTokens(info.used), Pal.muted) }
             addRow(title ?? s.label, s.bytes, s.cpu, c,
                    KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false),
                    tip: "Detener", ctx: ctx)
