@@ -27,6 +27,11 @@ enum Config {
     static let idleAfter: TimeInterval = 120     // ... de forma continua por 120 s
     static let warnFraction = 0.75               // amarillo: >= 75 % de un umbral
     static let pauseDuration: TimeInterval = 3600
+    static let updateCheckInterval: TimeInterval = 6 * 3600
+    static let tagsURL = "https://api.github.com/repos/xklbr/guachiman/tags?per_page=20"
+    static let releasesPageURL = "https://github.com/xklbr/guachiman/releases"
+    static let lastUpdateCheckKey = "lastUpdateCheck"
+    static let notifiedVersionKey = "notifiedVersion"
     static let autoCloseKey = "autoCloseOrphans"
     static let aiKey = "aiEnabled"
     static let relayIdleStop: TimeInterval = 300   // relay apagado tras 5 min seguidos sin alerta activa
@@ -130,6 +135,60 @@ func cpuTicks() -> (busy: UInt64, total: UInt64)? {
 func pauseActive(until: Date?, now: Date) -> Bool {
     guard let until else { return false }
     return now < until
+}
+
+/// Componentes numéricos de "v0.7.0", "0.7.0" o "0.7"; nil ante basura o sufijos (p. ej. "-beta").
+func parseVersion(_ s: String) -> [Int]? {
+    let t = s.hasPrefix("v") ? String(s.dropFirst()) : s
+    let parts = t.split(separator: ".", omittingEmptySubsequences: false)
+    guard (1...4).contains(parts.count) else { return nil }
+    var out: [Int] = []
+    for p in parts {
+        guard !p.isEmpty, p.count <= 6, p.allSatisfy({ $0 >= "0" && $0 <= "9" }), let n = Int(p) else { return nil }
+        out.append(n)
+    }
+    return out
+}
+
+func isNewerVersion(_ a: String, than b: String) -> Bool {
+    guard var x = parseVersion(a), var y = parseVersion(b) else { return false }
+    let n = max(x.count, y.count)
+    x += Array(repeating: 0, count: n - x.count)
+    y += Array(repeating: 0, count: n - y.count)
+    return x.lexicographicallyPrecedes(y) ? false : x != y
+}
+
+/// Mayor versión entre los `name` de los tags que pasan `parseVersion` (sin "v"); no asume orden.
+func latestVersion(fromTagsJSON data: Data) -> String? {
+    guard let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return nil }
+    var best: String?
+    for tag in arr {
+        guard let name = tag["name"] as? String, parseVersion(name) != nil else { continue }
+        let v = name.hasPrefix("v") ? String(name.dropFirst()) : name
+        if best == nil || isNewerVersion(v, than: best!) { best = v }
+    }
+    return best
+}
+
+func shouldCheckForUpdate(last: Date?, now: Date) -> Bool {
+    guard let last else { return true }
+    return now.timeIntervalSince(last) >= Config.updateCheckInterval || last > now
+}
+
+var installedVersion: String {
+    Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+}
+
+/// Consulta anónima a la API pública de GitHub; nil ante cualquier fallo. El callback corre en otra cola.
+func fetchLatestVersion(completion: @escaping (String?) -> Void) {
+    guard let url = URL(string: Config.tagsURL) else { return completion(nil) }
+    var req = URLRequest(url: url, timeoutInterval: 10)
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    req.setValue("Guachiman/\(installedVersion)", forHTTPHeaderField: "User-Agent")
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        guard let data, (resp as? HTTPURLResponse)?.statusCode == 200 else { return completion(nil) }
+        completion(latestVersion(fromTagsJSON: data))
+    }.resume()
 }
 
 func launchAgentPlist(executable: String) -> [String: Any] {
@@ -468,10 +527,212 @@ func sessionTitle(pid: pid_t) -> String? {
 /// Título ya conocido, sin leer disco.
 func cachedSessionTitle(pid: pid_t) -> String? { titleCache[pid]?.title }
 
-func pruneTitleCache(live: Set<pid_t>) { titleCache = titleCache.filter { live.contains($0.key) } }
+func pruneTitleCache(live: Set<pid_t>) {
+    titleCache = titleCache.filter { live.contains($0.key) }
+    ctxCache = ctxCache.filter { live.contains($0.key) }
+}
 
 /// Etiqueta visible: título de Claude Code (máx. 50) o, sin él, la carpeta.
 func sessionLabel(_ s: Session) -> String { sessionTitle(pid: s.pid).map(truncatedTitle) ?? s.label }
+
+/// "ctx 192k": tokens usados redondeados a miles; menos de 1 000 → "ctx <1k".
+func formatContextTokens(_ used: Int) -> String {
+    used < 1000 ? "ctx <1k" : "ctx \((used + 500) / 1000)k"
+}
+
+/// Último mensaje con `message.usage` (no vacío) del texto de una transcripción; ignora líneas rotas.
+func parseContextUsage(_ text: String) -> Int? {
+    for line in text.split(separator: "\n").reversed() where line.contains("\"usage\"") {
+        guard let o = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
+              let m = o["message"] as? [String: Any], let u = m["usage"] as? [String: Any] else { continue }
+        func n(_ k: String) -> Int { (u[k] as? NSNumber)?.intValue ?? 0 }
+        let used = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens")
+        if used > 0 { return used }
+    }
+    return nil
+}
+
+let autoCompactEnvKey = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+
+/// Porcentaje de auto-compact guardado en `env` de settings.json (nil = por defecto de Claude).
+func autoCompactPct(_ root: [String: Any]) -> Int? {
+    let v = (root["env"] as? [String: Any])?[autoCompactEnvKey]
+    return (v as? String).flatMap { Int($0) } ?? (v as? NSNumber)?.intValue
+}
+
+/// Copia de settings con solo `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` cambiado; nil lo elimina (y `env` si queda vacío).
+func applyAutoCompact(_ root: [String: Any], pct: Int?) -> [String: Any] {
+    var r = root
+    var env = (r["env"] as? [String: Any]) ?? [:]
+    if let pct { env[autoCompactEnvKey] = String(pct) } else { env[autoCompactEnvKey] = nil }
+    r["env"] = env.isEmpty ? nil : env
+    return r
+}
+
+/// Edición textual mínima de `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` en el texto de settings.json (conserva orden y formato).
+/// nil = no se pudo editar con seguridad. Texto vacío = archivo inexistente.
+func editAutoCompact(text: String, pct: Int?) -> String? {
+    let b = Array(text.utf8)
+    let keyBytes = Array(autoCompactEnvKey.utf8)
+    let valueBytes = Array("\"\(pct ?? 0)\"".utf8)
+    let entry = Array("\"\(autoCompactEnvKey)\": ".utf8) + valueBytes
+    let envEntry = Array("\"env\": {".utf8) + entry + Array("}".utf8)
+    func splice(_ r: Range<Int>, _ ins: [UInt8]) -> String? {
+        String(bytes: Array(b[..<r.lowerBound]) + ins + Array(b[r.upperBound...]), encoding: .utf8)
+    }
+    func insertFirst(_ o: JSONObjectSpan, _ item: [UInt8]) -> String? {
+        guard let first = o.members.first else { return splice((o.open + 1)..<o.close, item) }
+        var sep = Array(", ".utf8)
+        if let nl = b[(o.open + 1)..<first.keyStart].lastIndex(of: 0x0A) {
+            sep = [0x2C, 0x0A] + Array(b[(nl + 1)..<first.keyStart])
+        }
+        return splice(first.keyStart..<first.keyStart, item + sep)
+    }
+    func remove(_ o: JSONObjectSpan, _ k: Int) -> String? {
+        let m = o.members
+        if m.count == 1 { return splice((o.open + 1)..<o.close, []) }
+        if k < m.count - 1 { return splice(m[k].keyStart..<m[k + 1].keyStart, []) }
+        return splice(m[k - 1].valEnd..<m[k].valEnd, [])
+    }
+    if text.isEmpty { return pct == nil ? text : "{" + String(decoding: envEntry, as: UTF8.self) + "}" }
+    guard let root = jsonObjectSpan(b, at: jsonSkipWS(b, 0)), jsonSkipWS(b, root.close + 1) == b.count else { return nil }
+    if let ei = root.members.firstIndex(where: { $0.keyName == Array("env".utf8) }) {
+        let em = root.members[ei]
+        guard let env = jsonObjectSpan(b, at: em.valStart), env.close + 1 == em.valEnd else { return nil }
+        if let ki = env.members.firstIndex(where: { $0.keyName == keyBytes }) {
+            if pct != nil { return splice(env.members[ki].valStart..<env.members[ki].valEnd, valueBytes) }
+            return env.members.count == 1 ? remove(root, ei) : remove(env, ki)
+        }
+        if pct == nil { return env.members.isEmpty ? remove(root, ei) : text }
+        return insertFirst(env, entry)
+    }
+    return pct == nil ? text : insertFirst(root, envEntry)
+}
+
+/// `editAutoCompact` solo si el resultado equivale a `applyAutoCompact` sobre el original; nil si no.
+func verifiedAutoCompactEdit(text: String, pct: Int?) -> String? {
+    func parse(_ t: String) -> [String: Any]? {
+        t.isEmpty ? [:] : (try? JSONSerialization.jsonObject(with: Data(t.utf8))) as? [String: Any]
+    }
+    guard let orig = parse(text), let out = editAutoCompact(text: text, pct: pct), let got = parse(out),
+          NSDictionary(dictionary: got).isEqual(to: applyAutoCompact(orig, pct: pct)) else { return nil }
+    return out
+}
+
+private struct JSONMember { var keyStart: Int; var keyName: [UInt8]; var valStart: Int; var valEnd: Int }
+private struct JSONObjectSpan { var open: Int; var close: Int; var members: [JSONMember] }
+
+private func jsonSkipWS(_ b: [UInt8], _ i: Int) -> Int {
+    var i = i
+    while i < b.count, b[i] == 0x20 || b[i] == 0x09 || b[i] == 0x0A || b[i] == 0x0D { i += 1 }
+    return i
+}
+
+/// `i` apunta a la comilla de apertura; devuelve el índice posterior a la de cierre.
+private func jsonStringEnd(_ b: [UInt8], _ i: Int) -> Int? {
+    var j = i + 1
+    while j < b.count {
+        if b[j] == 0x5C { j += 2; continue }
+        if b[j] == 0x22 { return j + 1 }
+        j += 1
+    }
+    return nil
+}
+
+private func jsonValueEnd(_ b: [UInt8], _ i: Int) -> Int? {
+    guard i < b.count else { return nil }
+    if b[i] == 0x22 { return jsonStringEnd(b, i) }
+    var j = i
+    if b[i] == 0x7B || b[i] == 0x5B {
+        var depth = 0
+        while j < b.count {
+            switch b[j] {
+            case 0x22:
+                guard let e = jsonStringEnd(b, j) else { return nil }
+                j = e
+                continue
+            case 0x7B, 0x5B: depth += 1
+            case 0x7D, 0x5D:
+                depth -= 1
+                if depth == 0 { return j + 1 }
+            default: break
+            }
+            j += 1
+        }
+        return nil
+    }
+    while j < b.count, ![0x2C, 0x7D, 0x5D, 0x20, 0x09, 0x0A, 0x0D].contains(b[j]) { j += 1 }
+    return j > i ? j : nil
+}
+
+private func jsonObjectSpan(_ b: [UInt8], at open: Int) -> JSONObjectSpan? {
+    guard open < b.count, b[open] == 0x7B else { return nil }
+    var members: [JSONMember] = []
+    var i = jsonSkipWS(b, open + 1)
+    if i < b.count, b[i] == 0x7D { return JSONObjectSpan(open: open, close: i, members: []) }
+    while i < b.count, b[i] == 0x22 {
+        guard let ke = jsonStringEnd(b, i) else { return nil }
+        var j = jsonSkipWS(b, ke)
+        guard j < b.count, b[j] == 0x3A else { return nil }
+        j = jsonSkipWS(b, j + 1)
+        guard let ve = jsonValueEnd(b, j) else { return nil }
+        members.append(JSONMember(keyStart: i, keyName: Array(b[(i + 1)..<(ke - 1)]), valStart: j, valEnd: ve))
+        i = jsonSkipWS(b, ve)
+        guard i < b.count else { return nil }
+        if b[i] == 0x7D { return JSONObjectSpan(open: open, close: i, members: members) }
+        guard b[i] == 0x2C else { return nil }
+        i = jsonSkipWS(b, i + 1)
+    }
+    return nil
+}
+
+private let claudeSettingsPath = claudeDir + "/settings.json"
+
+/// nil si el archivo existe pero no es un JSON objeto; `[:]` si no existe.
+private func readClaudeSettings() -> [String: Any]? {
+    guard let data = FileManager.default.contents(atPath: claudeSettingsPath) else { return [:] }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+private func writeClaudeSettings(text: String) throws {
+    let data = Data(text.utf8)
+    let url = URL(fileURLWithPath: claudeSettingsPath).resolvingSymlinksInPath()
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url, options: .atomic)
+}
+
+struct ContextInfo { var used: Int }
+private struct CtxEntry { var path: String?; var mtime: Date; var info: ContextInfo? }
+private var ctxCache: [pid_t: CtxEntry] = [:]
+
+/// Tokens de contexto usados por la sesión según la cola de su transcripción. Solo se llama al abrir el panel o en `--once`;
+/// relee únicamente si cambió el mtime.
+func sessionContext(pid: pid_t) -> ContextInfo? {
+    var entry = ctxCache[pid] ?? CtxEntry(path: nil, mtime: .distantPast, info: nil)
+    defer { ctxCache[pid] = entry }
+    if entry.path == nil {
+        guard let data = FileManager.default.contents(atPath: "\(claudeDir)/sessions/\(pid).json"),
+              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let sid = o["sessionId"] as? String, let cwd = o["cwd"] as? String else { return nil }
+        entry.path = transcriptPath(sessionId: sid, cwd: cwd)
+    }
+    guard let path = entry.path,
+          let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    else { entry.path = nil; return nil }
+    if mtime == entry.mtime { return entry.info }
+    entry.mtime = mtime
+    entry.info = nil
+    guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? fh.close() }
+    let size = (try? fh.seekToEnd()) ?? 0
+    let tail: UInt64 = 256 * 1024
+    try? fh.seek(toOffset: size > tail ? size - tail : 0)
+    let text = String(decoding: (try? fh.readToEnd()) ?? Data(), as: UTF8.self)
+    if let u = parseContextUsage(text) {
+        entry.info = ContextInfo(used: u)
+    }
+    return entry.info
+}
 
 func runSelfTest() {
     precondition(parseAuthLoggedIn(Data(#"{"loggedIn":true,"authMethod":"claude.ai"}"#.utf8)))
@@ -602,6 +863,20 @@ func runSelfTest() {
     precondition(pauseActive(until: now + 10, now: now))
     precondition(!pauseActive(until: now - 1, now: now))
 
+    precondition(parseVersion("v0.7.0") == [0, 7, 0] && parseVersion("0.7.0") == [0, 7, 0] && parseVersion("0.7") == [0, 7])
+    precondition(parseVersion("") == nil && parseVersion("v") == nil && parseVersion("abc") == nil)
+    precondition(parseVersion("0.8.0-beta") == nil && parseVersion("1..2") == nil && parseVersion("0.7.") == nil)
+    precondition(isNewerVersion("0.10.0", than: "0.9.9") && !isNewerVersion("0.9.9", than: "0.10.0"))
+    precondition(!isNewerVersion("0.7", than: "0.7.0") && !isNewerVersion("0.7.0", than: "0.7"))
+    precondition(isNewerVersion("v0.7.1", than: "0.7") && !isNewerVersion("junk", than: "0.7"))
+    precondition(latestVersion(fromTagsJSON: Data(#"[{"name":"v0.6.2"},{"name":"v0.7.0"},{"name":"v0.8.0-beta"},{"name":"foo"}]"#.utf8)) == "0.7.0")
+    precondition(latestVersion(fromTagsJSON: Data("[]".utf8)) == nil)
+    precondition(latestVersion(fromTagsJSON: Data(#"[{"name":"foo"},{"name":"v1-rc"},{}]"#.utf8)) == nil)
+    precondition(latestVersion(fromTagsJSON: Data(#"{"name":"v0.8.0"}"#.utf8)) == nil && latestVersion(fromTagsJSON: Data("no".utf8)) == nil)
+    precondition(shouldCheckForUpdate(last: nil, now: now))
+    precondition(!shouldCheckForUpdate(last: now - 60, now: now))
+    precondition(shouldCheckForUpdate(last: now - Config.updateCheckInterval, now: now))
+
     let d = launchAgentPlist(executable: "/a/Guachiman")
     precondition(d["Label"] as? String == "io.github.guachiman")
     precondition(d["ProgramArguments"] as? [String] == ["/a/Guachiman"])
@@ -616,6 +891,65 @@ func runSelfTest() {
     precondition(extractSessionTitle("{\"type\":\"ai-title\",\"aiTitle\":\"uno\"}\nbasura\n{\"type\":\"ai-title\",\"aiTitle\":\"dos\"}") == "dos")
     precondition(extractSessionTitle("{\"type\":\"user\"}\n") == nil)
     precondition(truncatedTitle(String(repeating: "x", count: 60)).count == 50 && truncatedTitle("hola") == "hola")
+    let tr = "{\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":20,\"cache_creation_input_tokens\":3}}}\n"
+        + "{\"message\":{\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":0}}}\n{\"type\":\"user\"}\nrota{\"usage\"\n"
+    precondition(parseContextUsage(tr) == 24 && parseContextUsage("{\"type\":\"user\"}") == nil)
+    precondition(formatContextTokens(0) == "ctx <1k" && formatContextTokens(999) == "ctx <1k" && formatContextTokens(1000) == "ctx 1k")
+    precondition(formatContextTokens(191_600) == "ctx 192k" && formatContextTokens(1_250_000) == "ctx 1250k")
+    let base: [String: Any] = ["model": "opus", "env": ["FOO": "1"]]
+    let on = applyAutoCompact(base, pct: 70)
+    precondition(autoCompactPct(on) == 70 && (on["env"] as? [String: Any])?["FOO"] as? String == "1" && on["model"] as? String == "opus")
+    precondition(autoCompactPct(applyAutoCompact(on, pct: nil)) == nil && (applyAutoCompact(on, pct: nil)["env"] as? [String: Any])?["FOO"] as? String == "1")
+    precondition(applyAutoCompact(applyAutoCompact([:], pct: 50), pct: nil).isEmpty && autoCompactPct(["env": [autoCompactEnvKey: 60]]) == 60)
+    let K = autoCompactEnvKey
+    func chk(_ src: String, _ pct: Int?, _ want: String?) {
+        let out = editAutoCompact(text: src, pct: pct)
+        precondition(out == want, "editAutoCompact: \(String(describing: out))")
+        precondition(verifiedAutoCompactEdit(text: src, pct: pct) == (want == nil ? nil : out))
+    }
+    let pre = "{\n  \"permissions\": {\n    \"allow\": [\"Bash(ls)\"]\n  },\n"
+    let post = "  \"model\": \"opus\"\n}\n"
+    let envNoKey = "  \"env\": {\n    \"ZED\": \"1\",\n    \"ALPHA\": \"2\"\n  },\n"
+    let envMid = "  \"env\": {\n    \"ZED\": \"1\",\n    \"\(K)\": \"50\",\n    \"ALPHA\": \"2\"\n  },\n"
+    let envOnly = "  \"env\": {\n    \"\(K)\": 60\n  },\n"
+    // a
+    chk(pre + envMid + post, 70, pre + envMid.replacingOccurrences(of: "\"50\"", with: "\"70\"") + post)
+    chk(pre + envMid + post, nil, pre + envNoKey + post)
+    chk(pre + "  \"env\": {\n    \"ZED\": \"1\",\n    \"\(K)\": \"50\"\n  },\n" + post, nil,
+        pre + "  \"env\": {\n    \"ZED\": \"1\"\n  },\n" + post)
+    chk(pre + "  \"env\": {\n    \"\(K)\": \"50\",\n    \"ZED\": \"1\"\n  },\n" + post, nil,
+        pre + "  \"env\": {\n    \"ZED\": \"1\"\n  },\n" + post)
+    // b
+    chk(pre + envNoKey + post, 70, pre + "  \"env\": {\n    \"\(K)\": \"70\",\n    \"ZED\": \"1\",\n    \"ALPHA\": \"2\"\n  },\n" + post)
+    chk("{\"env\": {\"ZED\": \"1\"}}", 70, "{\"env\": {\"\(K)\": \"70\", \"ZED\": \"1\"}}")
+    chk(pre + "  \"env\": {},\n" + post, 70, pre + "  \"env\": {\"\(K)\": \"70\"},\n" + post)
+    chk(pre + envNoKey + post, nil, pre + envNoKey + post)
+    // c
+    chk(pre + post, 70, "{\n  \"env\": {\"\(K)\": \"70\"},\n  \"permissions\": {\n    \"allow\": [\"Bash(ls)\"]\n  },\n" + post)
+    chk("{}\n", 70, "{\"env\": {\"\(K)\": \"70\"}}\n")
+    chk("{}", 70, "{\"env\": {\"\(K)\": \"70\"}}")
+    chk("", 70, "{\"env\": {\"\(K)\": \"70\"}}")
+    chk("", nil, "")
+    // d
+    chk(pre + envOnly + post, nil, pre + post)
+    chk(pre + "  \"env\": {},\n" + post, nil, pre + post)
+    chk("{\n  \"env\": {\"\(K)\": \"1\"}\n}\n", nil, "{}\n")
+    chk("{\n  \"model\": \"opus\",\n  \"env\": {\"\(K)\": \"1\"}\n}\n", nil, "{\n  \"model\": \"opus\"\n}\n")
+    // e
+    chk(pre + envMid + "  \"model\": \"opus\"\n}", 80, pre + envMid.replacingOccurrences(of: "\"50\"", with: "\"80\"") + "  \"model\": \"opus\"\n}")
+    chk("{\"model\": 1}", 70, "{\"env\": {\"\(K)\": \"70\"}, \"model\": 1}")
+    // la clave y "env" dentro de strings de otras claves no se confunden
+    let note = "  \"note\": \"ver \\\"env\\\": {\\\"\(K)\\\": \\\"x\\\"} aquí\",\n"
+    chk("{\n" + note + envNoKey + post, 70, "{\n" + note + "  \"env\": {\n    \"\(K)\": \"70\",\n    \"ZED\": \"1\",\n    \"ALPHA\": \"2\"\n  },\n" + post)
+    chk("{\n" + note + post, 70, "{\n  \"env\": {\"\(K)\": \"70\"},\n" + note + post)
+    chk("{\n" + note + "  \"env\": {\n    \"\(K)\": \"5\"\n  }\n}\n", nil, "{\n" + note.dropLast(2) + "\n}\n")
+    // JSON inválido
+    chk("{\"a\": 1,}", 70, nil)
+    chk("{\"a\": \"x\": \"y\"}", 70, nil)
+    chk("{\"env\": 3}", 70, nil)
+    chk("[1]", 70, nil)
+    chk("{\"a\": 1} basura", 70, nil)
+    precondition(verifiedAutoCompactEdit(text: "   ", pct: 70) == nil)
     print("selftest OK")
 }
 
@@ -866,9 +1200,9 @@ func runOnce() {
     func status(_ bytes: UInt64, _ cpu: Double, _ ramLimit: UInt64, _ cpuLimit: Double?) -> String {
         rowColor(bytes: bytes, cpu: cpu, ramLimit: ramLimit, cpuLimit: cpuLimit, idleFor: 0).rawValue
     }
-    print("PID\tETIQUETA\tTITULO\tTOTAL_MB\tESTADO\tCWD")
+    print("PID\tETIQUETA\tTITULO\tTOTAL_MB\tESTADO\tCTX\tCWD")
     for s in snap.sessions {
-        print("\(s.pid)\t\(s.label)\t\(sessionTitle(pid: s.pid).map(truncatedTitle) ?? "-")\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(s.cwd)")
+        print("\(s.pid)\t\(s.label)\t\(sessionTitle(pid: s.pid).map(truncatedTitle) ?? "-")\t\(s.bytes / 1_048_576)\t\(status(s.bytes, s.cpu, limit, Config.appCpuPercent))\t\(sessionContext(pid: s.pid).map { formatContextTokens($0.used) } ?? "-")\t\(s.cwd)")
     }
     if snap.sessions.isEmpty { print("(sin sesiones de Claude)") }
     print("")
@@ -1026,7 +1360,7 @@ final class PanelRow: FlippedView {
     private var area: NSTrackingArea?
 
     init(width: CGFloat, text: String, memory: String, cpu: String, color: NSColor, stopTag: Int?, stopLabel: String,
-         stopTip: String, target: AnyObject, action: Selector) {
+         stopTip: String, target: AnyObject, action: Selector, ctx: (text: String, color: NSColor)? = nil) {
         let colW: CGFloat = 30, memW: CGFloat = 64
         let colX = width - 8 - colW
         let memX = colX - 8 - memW
@@ -1040,7 +1374,12 @@ final class PanelRow: FlippedView {
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.cornerRadius = 3
         addSubview(dot)
-        addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22, height: 16)))
+        let ctxW: CGFloat = ctx == nil ? 0 : 60
+        addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22 - ctxW, height: 16)))
+        if let ctx {
+            addSubview(panelLabel(ctx.text, size: 10.5, mono: true, color: ctx.color, align: .right,
+                                  frame: NSRect(x: memX - 4 - ctxW, y: 5, width: ctxW, height: 14)))
+        }
         addSubview(panelLabel(memory, size: 11, mono: true, color: Pal.muted, align: .right,
                               frame: NSRect(x: memX, y: 5, width: memW, height: 14)))
         addSubview(cpuLabel)
@@ -1130,6 +1469,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termSource: DispatchSourceSignal?
     private var lastAlert: [String: (date: Date, value: Double)] = [:]
     private var timer: Timer?
+    private var availableVersion: String?
+    private var checkingUpdate = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let button = statusItem.button {
@@ -1168,6 +1509,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if wantsTest { self.notifier.send("Prueba: Guachiman puede notificarte") }
             if let note = updatedNote { self.notifier.send(note) }
             self.poll()
+            self.checkForUpdate(force: false)
+        }
+    }
+
+    /// `force`: ignora el intervalo y avisa del resultado aunque no haya novedad.
+    private func checkForUpdate(force: Bool) {
+        let ud = UserDefaults.standard
+        guard !checkingUpdate, force || shouldCheckForUpdate(last: ud.object(forKey: Config.lastUpdateCheckKey) as? Date, now: Date())
+        else { return }
+        checkingUpdate = true
+        fetchLatestVersion { [weak self] latest in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checkingUpdate = false
+                ud.set(Date(), forKey: Config.lastUpdateCheckKey)
+                let cur = installedVersion
+                guard let v = latest else {
+                    if force { self.notifier.send("No se pudo comprobar la versión") }
+                    return
+                }
+                guard isNewerVersion(v, than: cur) else {
+                    self.availableVersion = nil
+                    if force { self.notifier.send("Ya tienes la última versión (\(cur))") }
+                    return
+                }
+                self.availableVersion = v
+                if ud.string(forKey: Config.notifiedVersionKey) != v, !pauseActive(until: self.pausedUntil, now: Date()) {
+                    self.notifier.send("Guachiman \(v) disponible. Actualiza desde el menú.")
+                    ud.set(v, forKey: Config.notifiedVersionKey)
+                }
+            }
         }
     }
 
@@ -1297,6 +1669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateUI(snap, alerting: anyOver || systemLow || orphanOver || appOver)
         schedule(Config.pollActive)
+        checkForUpdate(force: false)
     }
 
     /// SIGTERM al huérfano y sus descendientes (hijos primero), tras reverificar con un snapshot nuevo.
@@ -1321,6 +1694,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleAutoClose() { autoClose.toggle() }
+
+    /// Edita solo el texto de `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` en ~/.claude/settings.json; no escribe si no se puede verificar.
+    @objc private func setAutoCompact(_ sender: NSMenuItem) {
+        let data = FileManager.default.contents(atPath: claudeSettingsPath)
+        let text = data.map { String(data: $0, encoding: .utf8) } ?? ""
+        guard let text, let out = verifiedAutoCompactEdit(text: text, pct: sender.representedObject as? Int) else {
+            notifier.send("No se pudo editar ~/.claude/settings.json; cámbialo a mano")
+            return
+        }
+        if out != text {
+            do { try writeClaudeSettings(text: out) } catch {
+                notifier.send("No se pudo escribir ~/.claude/settings.json: \(error.localizedDescription)")
+                return
+            }
+        }
+        if let p = panel { fillPanel(p) }
+    }
 
     @objc private func togglePause() {
         pausedUntil = pauseActive(until: pausedUntil, now: Date()) ? nil : Date().addingTimeInterval(Config.pauseDuration)
@@ -1615,7 +2005,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         rowTargets = []
-        func addRow(_ text: String, _ bytes: UInt64, _ cpu: Double, _ color: RowColor, _ t: KillTarget, tip: String) {
+        func addRow(_ text: String, _ bytes: UInt64, _ cpu: Double, _ color: RowColor, _ t: KillTarget, tip: String,
+                    ctx: (text: String, color: NSColor)? = nil) {
             var tag: Int?
             if !t.pids.isEmpty, !t.pids.contains(getpid()) {   // nunca ofrece cerrar a Guachiman
                 rowTargets.append(t)
@@ -1623,7 +2014,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let r = PanelRow(width: iw, text: text, memory: formatBytes(bytes), cpu: "\(Int(cpu.rounded()))%",
                              color: nsColor(color), stopTag: tag, stopLabel: "Cerrar \(t.name)", stopTip: tip,
-                             target: self, action: #selector(stopClicked(_:)))
+                             target: self, action: #selector(stopClicked(_:)), ctx: ctx)
             r.frame.origin = NSPoint(x: pad, y: y)
             root.addSubview(r)
             y += rowH
@@ -1676,9 +2067,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let c = rowColor(bytes: s.bytes, cpu: s.cpu, ramLimit: limit, cpuLimit: Config.appCpuPercent,
                              idleFor: lastIdle["session:\(s.pid)"] ?? 0)
             let title = sessionTitle(pid: s.pid).map(truncatedTitle)
+            var ctx: (text: String, color: NSColor)?
+            if let info = sessionContext(pid: s.pid) { ctx = (formatContextTokens(info.used), Pal.muted) }
             addRow(title ?? s.label, s.bytes, s.cpu, c,
                    KillTarget(name: title ?? "Claude (\(s.label))", bytes: s.bytes, pids: s.tree, appPath: nil, expandTree: false),
-                   tip: "Detener")
+                   tip: "Detener", ctx: ctx)
         }
 
         divider(topMargin: 2)
@@ -1727,6 +2120,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(toggle("Pausar 1 h", #selector(togglePause), on: false))
         }
         menu.addItem(toggle("Cerrar huérfanos automáticamente", #selector(toggleAutoClose), on: autoClose))
+        let acItem = NSMenuItem(title: "Auto-compact de Claude", action: nil, keyEquivalent: "")
+        let acMenu = NSMenu()
+        let acCurrent = readClaudeSettings().flatMap(autoCompactPct)
+        for pct in [nil, 50, 60, 70, 80] as [Int?] {
+            let it = NSMenuItem(title: pct.map { "\($0) %" } ?? "Por defecto de Claude", action: #selector(setAutoCompact(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = pct
+            it.state = pct == acCurrent ? .on : .off
+            acMenu.addItem(it)
+        }
+        acItem.submenu = acMenu
+        menu.addItem(acItem)
         menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
                             on: FileManager.default.fileExists(atPath: agentURL.path)))
         if !notifier.isAuthorized {
@@ -1735,10 +2140,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        let updateItem = NSMenuItem(title: "Actualizar", action: #selector(runUpdate), keyEquivalent: "")
+        let updateItem = NSMenuItem(title: availableVersion.map { "Actualizar a \($0)" } ?? "Actualizar",
+                                    action: #selector(runUpdate), keyEquivalent: "")
         updateItem.target = self
         updateItem.isEnabled = !updating
+        if availableVersion != nil {
+            let dot = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { r in
+                NSColor.systemRed.setFill()
+                NSBezierPath(ovalIn: r).fill()
+                return true
+            }
+            updateItem.image = dot
+        }
         menu.addItem(updateItem)
+        let checkItem = NSMenuItem(title: "Buscar actualizaciones", action: #selector(checkUpdateClicked), keyEquivalent: "")
+        checkItem.target = self
+        menu.addItem(checkItem)
         let uninstallItem = NSMenuItem(title: "Desinstalar", action: #selector(confirmUninstall), keyEquivalent: "")
         uninstallItem.target = self
         menu.addItem(uninstallItem)
@@ -1751,6 +2168,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var updating = false
+
+    @objc private func checkUpdateClicked() { checkForUpdate(force: true) }
 
     @objc private func runUpdate() {
         guard !updating, let script = Bundle.main.resourcePath.map({ $0 + "/update.sh" }),
@@ -1770,6 +2189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.updating = false
+                if status == 0 || status == 10 { self.availableVersion = nil }
                 if status == 0 { return }
                 let alert = NSAlert()
                 if status == 10 {
@@ -1779,8 +2199,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     alert.messageText = last
                 }
                 alert.addButton(withTitle: "OK")
+                let offerReleases = status == 2 && self.availableVersion != nil
+                if offerReleases { alert.addButton(withTitle: "Abrir releases") }
                 NSApp.activate(ignoringOtherApps: true)
-                alert.runModal()
+                if alert.runModal() == .alertSecondButtonReturn, offerReleases,
+                   let url = URL(string: Config.releasesPageURL) {
+                    NSWorkspace.shared.open(url)
+                }
             }
         }
         guard (try? p.run()) != nil else { updating = false; return }
@@ -1950,6 +2375,19 @@ if CommandLine.arguments.contains("--update") {
     guard (try? p.run()) != nil else { exit(1) }
     p.waitUntilExit()
     exit(p.terminationStatus)
+}
+
+if CommandLine.arguments.contains("--check-update") {
+    let sem = DispatchSemaphore(value: 0)
+    var latest: String?
+    fetchLatestVersion { latest = $0; sem.signal() }
+    guard sem.wait(timeout: .now() + 12) == .success, let v = latest else {
+        FileHandle.standardError.write(Data("guachiman: no se pudo comprobar la versión\n".utf8))
+        exit(1)
+    }
+    let cur = installedVersion
+    print(isNewerVersion(v, than: cur) ? "Última versión: \(v) (instalada: \(cur))" : "Al día (\(cur))")
+    exit(0)
 }
 
 if CommandLine.arguments.contains("--selftest") {
