@@ -28,6 +28,11 @@ enum Config {
     static let idleAfter: TimeInterval = 120     // ... de forma continua por 120 s
     static let warnFraction = 0.75               // amarillo: >= 75 % de un umbral
     static let pauseDuration: TimeInterval = 3600
+    static let updateCheckInterval: TimeInterval = 6 * 3600
+    static let releasesLatestURL = "https://api.github.com/repos/xklbr/guachiman/releases/latest"
+    static let releasesPageURL = "https://github.com/xklbr/guachiman/releases/latest"
+    static let lastUpdateCheckKey = "lastUpdateCheck"
+    static let notifiedVersionKey = "notifiedVersion"
     static let autoCloseKey = "autoCloseOrphans"
     static let autoKillSaturatingKey = "autoKillSaturating"
     static let saturatingKillDelay: TimeInterval = 15   // aviso antes de cerrar un huérfano que satura
@@ -133,6 +138,56 @@ func cpuTicks() -> (busy: UInt64, total: UInt64)? {
 func pauseActive(until: Date?, now: Date) -> Bool {
     guard let until else { return false }
     return now < until
+}
+
+/// Componentes numéricos de "v0.7.0", "0.7.0" o "0.7"; nil ante basura o sufijos (p. ej. "-beta").
+func parseVersion(_ s: String) -> [Int]? {
+    let t = s.hasPrefix("v") ? String(s.dropFirst()) : s
+    let parts = t.split(separator: ".", omittingEmptySubsequences: false)
+    guard (1...4).contains(parts.count) else { return nil }
+    var out: [Int] = []
+    for p in parts {
+        guard !p.isEmpty, p.count <= 6, p.allSatisfy({ $0 >= "0" && $0 <= "9" }), let n = Int(p) else { return nil }
+        out.append(n)
+    }
+    return out
+}
+
+func isNewerVersion(_ a: String, than b: String) -> Bool {
+    guard var x = parseVersion(a), var y = parseVersion(b) else { return false }
+    let n = max(x.count, y.count)
+    x += Array(repeating: 0, count: n - x.count)
+    y += Array(repeating: 0, count: n - y.count)
+    return x.lexicographicallyPrecedes(y) ? false : x != y
+}
+
+/// `tag_name` de la release sin "v", solo si no es draft/prerelease y pasa `parseVersion`.
+func latestVersion(fromReleaseJSON data: Data) -> String? {
+    guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          (obj["draft"] as? Bool) != true, (obj["prerelease"] as? Bool) != true,
+          let tag = obj["tag_name"] as? String, parseVersion(tag) != nil else { return nil }
+    return tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+}
+
+func shouldCheckForUpdate(last: Date?, now: Date) -> Bool {
+    guard let last else { return true }
+    return now.timeIntervalSince(last) >= Config.updateCheckInterval || last > now
+}
+
+var installedVersion: String {
+    Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+}
+
+/// Consulta anónima a la API pública de GitHub; nil ante cualquier fallo. El callback corre en otra cola.
+func fetchLatestVersion(completion: @escaping (String?) -> Void) {
+    guard let url = URL(string: Config.releasesLatestURL) else { return completion(nil) }
+    var req = URLRequest(url: url, timeoutInterval: 10)
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    req.setValue("Guachiman/\(installedVersion)", forHTTPHeaderField: "User-Agent")
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        guard let data, (resp as? HTTPURLResponse)?.statusCode == 200 else { return completion(nil) }
+        completion(latestVersion(fromReleaseJSON: data))
+    }.resume()
 }
 
 func launchAgentPlist(executable: String) -> [String: Any] {
@@ -812,6 +867,21 @@ func runSelfTest() {
     precondition(pauseActive(until: now + 10, now: now))
     precondition(!pauseActive(until: now - 1, now: now))
 
+    precondition(parseVersion("v0.7.0") == [0, 7, 0] && parseVersion("0.7.0") == [0, 7, 0] && parseVersion("0.7") == [0, 7])
+    precondition(parseVersion("") == nil && parseVersion("v") == nil && parseVersion("abc") == nil)
+    precondition(parseVersion("0.8.0-beta") == nil && parseVersion("1..2") == nil && parseVersion("0.7.") == nil)
+    precondition(isNewerVersion("0.10.0", than: "0.9.9") && !isNewerVersion("0.9.9", than: "0.10.0"))
+    precondition(!isNewerVersion("0.7", than: "0.7.0") && !isNewerVersion("0.7.0", than: "0.7"))
+    precondition(isNewerVersion("v0.7.1", than: "0.7") && !isNewerVersion("junk", than: "0.7"))
+    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"v0.8.0","draft":false,"prerelease":false}"#.utf8)) == "0.8.0")
+    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"v0.8.0","prerelease":true}"#.utf8)) == nil)
+    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"v0.8.0","draft":true}"#.utf8)) == nil)
+    precondition(latestVersion(fromReleaseJSON: Data(#"{"tag_name":"<b>x</b>"}"#.utf8)) == nil)
+    precondition(latestVersion(fromReleaseJSON: Data(#"{}"#.utf8)) == nil && latestVersion(fromReleaseJSON: Data("no".utf8)) == nil)
+    precondition(shouldCheckForUpdate(last: nil, now: now))
+    precondition(!shouldCheckForUpdate(last: now - 60, now: now))
+    precondition(shouldCheckForUpdate(last: now - Config.updateCheckInterval, now: now))
+
     let d = launchAgentPlist(executable: "/a/Guachiman")
     precondition(d["Label"] as? String == "io.github.guachiman")
     precondition(d["ProgramArguments"] as? [String] == ["/a/Guachiman"])
@@ -1413,6 +1483,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var termSource: DispatchSourceSignal?
     private var lastAlert: [String: (date: Date, value: Double)] = [:]
     private var timer: Timer?
+    private var availableVersion: String?
+    private var checkingUpdate = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let button = statusItem.button {
@@ -1451,6 +1523,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if wantsTest { self.notifier.send("Prueba: Guachiman puede notificarte") }
             if let note = updatedNote { self.notifier.send(note) }
             self.poll()
+            self.checkForUpdate(force: false)
+        }
+    }
+
+    /// `force`: ignora el intervalo y avisa del resultado aunque no haya novedad.
+    private func checkForUpdate(force: Bool) {
+        let ud = UserDefaults.standard
+        guard !checkingUpdate, force || shouldCheckForUpdate(last: ud.object(forKey: Config.lastUpdateCheckKey) as? Date, now: Date())
+        else { return }
+        checkingUpdate = true
+        fetchLatestVersion { [weak self] latest in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.checkingUpdate = false
+                ud.set(Date(), forKey: Config.lastUpdateCheckKey)
+                let cur = installedVersion
+                guard let v = latest else {
+                    if force { self.notifier.send("No se pudo comprobar la versión") }
+                    return
+                }
+                guard isNewerVersion(v, than: cur) else {
+                    self.availableVersion = nil
+                    if force { self.notifier.send("Ya tienes la última versión (\(cur))") }
+                    return
+                }
+                self.availableVersion = v
+                if ud.string(forKey: Config.notifiedVersionKey) != v, !pauseActive(until: self.pausedUntil, now: Date()) {
+                    self.notifier.send("Guachiman \(v) disponible. Actualiza desde el menú.")
+                    ud.set(v, forKey: Config.notifiedVersionKey)
+                }
+            }
         }
     }
 
@@ -1584,6 +1687,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateUI(snap, alerting: anyOver || systemLow || orphanOver || appOver)
         schedule(Config.pollActive)
+        checkForUpdate(force: false)
     }
 
     /// SIGTERM al huérfano y sus descendientes (hijos primero), tras reverificar con un snapshot nuevo.
@@ -2092,10 +2196,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        let updateItem = NSMenuItem(title: "Actualizar", action: #selector(runUpdate), keyEquivalent: "")
+        let updateItem = NSMenuItem(title: availableVersion.map { "Actualizar a \($0)" } ?? "Actualizar",
+                                    action: #selector(runUpdate), keyEquivalent: "")
         updateItem.target = self
         updateItem.isEnabled = !updating
+        if availableVersion != nil {
+            let dot = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { r in
+                NSColor.systemRed.setFill()
+                NSBezierPath(ovalIn: r).fill()
+                return true
+            }
+            updateItem.image = dot
+        }
         menu.addItem(updateItem)
+        let checkItem = NSMenuItem(title: "Buscar actualizaciones", action: #selector(checkUpdateClicked), keyEquivalent: "")
+        checkItem.target = self
+        menu.addItem(checkItem)
         let uninstallItem = NSMenuItem(title: "Desinstalar", action: #selector(confirmUninstall), keyEquivalent: "")
         uninstallItem.target = self
         menu.addItem(uninstallItem)
@@ -2108,6 +2224,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var updating = false
+
+    @objc private func checkUpdateClicked() { checkForUpdate(force: true) }
 
     @objc private func runUpdate() {
         guard !updating, let script = Bundle.main.resourcePath.map({ $0 + "/update.sh" }),
@@ -2127,6 +2245,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.updating = false
+                if status == 0 || status == 10 { self.availableVersion = nil }
                 if status == 0 { return }
                 let alert = NSAlert()
                 if status == 10 {
@@ -2136,8 +2255,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     alert.messageText = last
                 }
                 alert.addButton(withTitle: "OK")
+                let offerReleases = status == 2 && self.availableVersion != nil
+                if offerReleases { alert.addButton(withTitle: "Abrir releases") }
                 NSApp.activate(ignoringOtherApps: true)
-                alert.runModal()
+                if alert.runModal() == .alertSecondButtonReturn, offerReleases,
+                   let url = URL(string: Config.releasesPageURL) {
+                    NSWorkspace.shared.open(url)
+                }
             }
         }
         guard (try? p.run()) != nil else { updating = false; return }
@@ -2307,6 +2431,19 @@ if CommandLine.arguments.contains("--update") {
     guard (try? p.run()) != nil else { exit(1) }
     p.waitUntilExit()
     exit(p.terminationStatus)
+}
+
+if CommandLine.arguments.contains("--check-update") {
+    let sem = DispatchSemaphore(value: 0)
+    var latest: String?
+    fetchLatestVersion { latest = $0; sem.signal() }
+    guard sem.wait(timeout: .now() + 12) == .success, let v = latest else {
+        FileHandle.standardError.write(Data("guachiman: no se pudo comprobar la versión\n".utf8))
+        exit(1)
+    }
+    let cur = installedVersion
+    print(isNewerVersion(v, than: cur) ? "Última versión: \(v) (instalada: \(cur))" : "Al día (\(cur))")
+    exit(0)
 }
 
 if CommandLine.arguments.contains("--selftest") {

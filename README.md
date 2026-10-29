@@ -49,6 +49,7 @@ Nunca se señalan los pids 0 y 1 ni el propio Guachiman. El menú se construye a
 - **Pausar 1 h**: durante una hora no hay notificaciones ni cierres automáticos; el menú y el ícono siguen actualizándose. Mientras dura aparece "Reanudar (pausado hasta HH:mm)", que cancela la pausa.
 - **Iniciar al encender**: crea o borra `~/Library/LaunchAgents/io.github.guachiman.plist` (surte efecto en el próximo inicio de sesión). "Salir" termina con estado 0, así que no se relanza.
 - **Actualizar**: ejecuta `brew update` y `brew upgrade guachiman` y reinicia la app si hay una versión nueva; solo funciona con la instalación de Homebrew (equivale a `guachiman --update`).
+  Guachiman busca versiones nuevas al arrancar y en los sondeos, como mucho una vez cada 6 h, y avisa con una notificación una sola vez por versión. Cuando hay una, el ítem pasa a "Actualizar a x.y.z" con un punto rojo. "Buscar actualizaciones" fuerza la consulta y avisa también si ya tienes la última o si no hay red. Sin Homebrew, el aviso de error ofrece "Abrir releases" para actualizar a mano. `guachiman --check-update` imprime la última versión publicada (sale con 1 si falla la red). La consulta es una petición HTTPS anónima a la API pública de GitHub y no envía datos.
 - **Desinstalar**: tras confirmar, borra la app, la instalación de Homebrew, la copia en `~/Applications`, los ajustes y los datos (equivale a `guachiman --uninstall`).
 - Solo se ejecuta una instancia a la vez.
 
