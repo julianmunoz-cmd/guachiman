@@ -2,8 +2,7 @@
 // las sesiones de Claude Code y los procesos huérfanos.
 // Solo cierra procesos cuando el usuario lo confirma con el botón de detener de cada fila
 // del panel, o con SIGTERM a huérfanos (ppid 1: node, vitest, next, playwright) si activa
-// "Cerrar huérfanos automáticamente" (apagado de fábrica). "Cerrar procesos que saturen el PC"
-// (también apagado) avisa 15 s antes de cerrar un huérfano grande cuando la memoria libre baja de 20 %.
+// "Cerrar huérfanos automáticamente" (apagado de fábrica).
 
 import AppKit
 import Darwin
@@ -34,8 +33,6 @@ enum Config {
     static let lastUpdateCheckKey = "lastUpdateCheck"
     static let notifiedVersionKey = "notifiedVersion"
     static let autoCloseKey = "autoCloseOrphans"
-    static let autoKillSaturatingKey = "autoKillSaturating"
-    static let saturatingKillDelay: TimeInterval = 15   // aviso antes de cerrar un huérfano que satura
     static let aiKey = "aiEnabled"
     static let relayIdleStop: TimeInterval = 300   // relay apagado tras 5 min seguidos sin alerta activa
     static let loginText = "Inicia sesión en Claude Code: abre la terminal y ejecuta `claude`"
@@ -555,11 +552,6 @@ func parseContextUsage(_ text: String) -> Int? {
     return nil
 }
 
-/// Cierre automático solo si la memoria sigue baja y el huérfano (nil = desapareció) sigue sobre el umbral.
-func shouldProceedSaturatingKill(freePercent: Int, orphanBytes: UInt64?) -> Bool {
-    freePercent < Config.systemFreeMinPercent && (orphanBytes ?? 0) > Config.orphanBytes
-}
-
 let autoCompactEnvKey = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 
 /// Porcentaje de auto-compact guardado en `env` de settings.json (nil = por defecto de Claude).
@@ -909,10 +901,6 @@ func runSelfTest() {
     precondition(autoCompactPct(on) == 70 && (on["env"] as? [String: Any])?["FOO"] as? String == "1" && on["model"] as? String == "opus")
     precondition(autoCompactPct(applyAutoCompact(on, pct: nil)) == nil && (applyAutoCompact(on, pct: nil)["env"] as? [String: Any])?["FOO"] as? String == "1")
     precondition(applyAutoCompact(applyAutoCompact([:], pct: 50), pct: nil).isEmpty && autoCompactPct(["env": [autoCompactEnvKey: 60]]) == 60)
-    precondition(shouldProceedSaturatingKill(freePercent: 19, orphanBytes: Config.orphanBytes + 1))
-    precondition(!shouldProceedSaturatingKill(freePercent: 20, orphanBytes: Config.orphanBytes + 1))
-    precondition(!shouldProceedSaturatingKill(freePercent: 5, orphanBytes: Config.orphanBytes))
-    precondition(!shouldProceedSaturatingKill(freePercent: 5, orphanBytes: nil))
     let K = autoCompactEnvKey
     func chk(_ src: String, _ pct: Int?, _ want: String?) {
         let out = editAutoCompact(text: src, pct: pct)
@@ -1471,11 +1459,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         get { UserDefaults.standard.bool(forKey: Config.autoCloseKey) }
         set { UserDefaults.standard.set(newValue, forKey: Config.autoCloseKey) }
     }
-    private var autoKillSaturating: Bool {
-        get { UserDefaults.standard.bool(forKey: Config.autoKillSaturatingKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Config.autoKillSaturatingKey) }
-    }
-    private var pendingKill: (pid: pid_t, name: String, work: DispatchWorkItem)?   // cierre con cuenta atrás
     private var aiEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: Config.aiKey) }
         set { UserDefaults.standard.set(newValue, forKey: Config.aiKey) }
@@ -1682,10 +1665,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 + snap.apps.prefix(2).map { (name: $0.name, bytes: $0.bytes) }
             alert(key: "system", value: Double(100 - snap.freePercent),
                   text: systemLowText(freePercent: snap.freePercent, consumers: consumers), now: now)
-            if autoKillSaturating, pendingKill == nil, !pauseActive(until: pausedUntil, now: now),
-               let o = snap.orphans.first(where: { $0.bytes > Config.orphanBytes && !closedAttempted.contains($0.pid) }) {
-                scheduleSaturatingKill(o)
-            }
         }
 
         updateUI(snap, alerting: anyOver || systemLow || orphanOver || appOver)
@@ -1716,32 +1695,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleAutoClose() { autoClose.toggle() }
 
-    /// Avisa y cierra el huérfano tras `saturatingKillDelay` salvo que el usuario cancele desde el menú.
-    private func scheduleSaturatingKill(_ o: OrphanProc) {
-        closedAttempted.insert(o.pid)
-        notifier.send("Memoria baja: Guachiman cerrará \(o.name) (pid \(o.pid)) en \(Int(Config.saturatingKillDelay)) s. Cancélalo en el menú.")
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.pendingKill = nil
-            let snap = takeSnapshot()
-            let bytes = snap.orphans.first(where: { $0.pid == o.pid })?.bytes
-            guard shouldProceedSaturatingKill(freePercent: snap.freePercent, orphanBytes: bytes) else {
-                let why = snap.freePercent >= Config.systemFreeMinPercent
-                    ? "la memoria se recuperó" : "ya no supera \(Config.orphanBytes / 1_048_576) MB"
-                self.notifier.send("Cierre de \(o.name) cancelado: \(why)")
-                return
-            }
-            self.close(o)
-        }
-        pendingKill = (o.pid, o.name, work)
-        DispatchQueue.main.asyncAfter(deadline: .now() + Config.saturatingKillDelay, execute: work)
-    }
-
-    @objc private func cancelPendingKill() {
-        pendingKill?.work.cancel()
-        pendingKill = nil
-    }
-
     /// Edita solo el texto de `env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` en ~/.claude/settings.json; no escribe si no se puede verificar.
     @objc private func setAutoCompact(_ sender: NSMenuItem) {
         let data = FileManager.default.contents(atPath: claudeSettingsPath)
@@ -1759,15 +1712,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let p = panel { fillPanel(p) }
     }
 
-    @objc private func toggleAutoKillSaturating() { autoKillSaturating.toggle() }
-
     @objc private func togglePause() {
-        if pauseActive(until: pausedUntil, now: Date()) {
-            pausedUntil = nil
-        } else {
-            pausedUntil = Date().addingTimeInterval(Config.pauseDuration)
-            cancelPendingKill()
-        }
+        pausedUntil = pauseActive(until: pausedUntil, now: Date()) ? nil : Date().addingTimeInterval(Config.pauseDuration)
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -2174,11 +2120,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(toggle("Pausar 1 h", #selector(togglePause), on: false))
         }
         menu.addItem(toggle("Cerrar huérfanos automáticamente", #selector(toggleAutoClose), on: autoClose))
-        menu.addItem(toggle("Cerrar procesos que saturen el PC", #selector(toggleAutoKillSaturating), on: autoKillSaturating))
-        if let pending = pendingKill {
-            menu.addItem(NSMenuItem(title: "Cancelar cierre de \(pending.name) (pid \(pending.pid))",
-                                    action: #selector(cancelPendingKill), keyEquivalent: ""))
-        }
         let acItem = NSMenuItem(title: "Auto-compact de Claude", action: nil, keyEquivalent: "")
         let acMenu = NSMenu()
         let acCurrent = readClaudeSettings().flatMap(autoCompactPct)
