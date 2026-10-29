@@ -496,6 +496,11 @@ func parseContextUsage(_ text: String) -> Int? {
     return nil
 }
 
+/// Cierre automático solo si la memoria sigue baja y el huérfano (nil = desapareció) sigue sobre el umbral.
+func shouldProceedSaturatingKill(freePercent: Int, orphanBytes: UInt64?) -> Bool {
+    freePercent < Config.systemFreeMinPercent && (orphanBytes ?? 0) > Config.orphanBytes
+}
+
 let autoCompactEnvKey = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
 
 /// Porcentaje de auto-compact guardado en `env` de settings.json (nil = por defecto de Claude).
@@ -831,6 +836,10 @@ func runSelfTest() {
     precondition(autoCompactPct(on) == 70 && (on["env"] as? [String: Any])?["FOO"] as? String == "1" && on["model"] as? String == "opus")
     precondition(autoCompactPct(applyAutoCompact(on, pct: nil)) == nil && (applyAutoCompact(on, pct: nil)["env"] as? [String: Any])?["FOO"] as? String == "1")
     precondition(applyAutoCompact(applyAutoCompact([:], pct: 50), pct: nil).isEmpty && autoCompactPct(["env": [autoCompactEnvKey: 60]]) == 60)
+    precondition(shouldProceedSaturatingKill(freePercent: 19, orphanBytes: Config.orphanBytes + 1))
+    precondition(!shouldProceedSaturatingKill(freePercent: 20, orphanBytes: Config.orphanBytes + 1))
+    precondition(!shouldProceedSaturatingKill(freePercent: 5, orphanBytes: Config.orphanBytes))
+    precondition(!shouldProceedSaturatingKill(freePercent: 5, orphanBytes: nil))
     let K = autoCompactEnvKey
     func chk(_ src: String, _ pct: Int?, _ want: String?) {
         let out = editAutoCompact(text: src, pct: pct)
@@ -1605,8 +1614,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closedAttempted.insert(o.pid)
         notifier.send("Memoria baja: Guachiman cerrará \(o.name) (pid \(o.pid)) en \(Int(Config.saturatingKillDelay)) s. Cancélalo en el menú.")
         let work = DispatchWorkItem { [weak self] in
-            self?.pendingKill = nil
-            self?.close(o)
+            guard let self else { return }
+            self.pendingKill = nil
+            let snap = takeSnapshot()
+            let bytes = snap.orphans.first(where: { $0.pid == o.pid })?.bytes
+            guard shouldProceedSaturatingKill(freePercent: snap.freePercent, orphanBytes: bytes) else {
+                let why = snap.freePercent >= Config.systemFreeMinPercent
+                    ? "la memoria se recuperó" : "ya no supera \(Config.orphanBytes / 1_048_576) MB"
+                self.notifier.send("Cierre de \(o.name) cancelado: \(why)")
+                return
+            }
+            self.close(o)
         }
         pendingKill = (o.pid, o.name, work)
         DispatchQueue.main.asyncAfter(deadline: .now() + Config.saturatingKillDelay, execute: work)
@@ -1637,7 +1655,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleAutoKillSaturating() { autoKillSaturating.toggle() }
 
     @objc private func togglePause() {
-        pausedUntil = pauseActive(until: pausedUntil, now: Date()) ? nil : Date().addingTimeInterval(Config.pauseDuration)
+        if pauseActive(until: pausedUntil, now: Date()) {
+            pausedUntil = nil
+        } else {
+            pausedUntil = Date().addingTimeInterval(Config.pauseDuration)
+            cancelPendingKill()
+        }
     }
 
     @objc private func toggleLaunchAtLogin() {
